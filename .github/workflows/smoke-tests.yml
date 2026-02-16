@@ -1,0 +1,151 @@
+name: Smoke Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  structure-check:
+    name: Repository Structure Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify directory structure
+        run: |
+          echo "Checking required directories..."
+          test -d agents || { echo "❌ agents/ directory missing"; exit 1; }
+          test -d master-agents || { echo "❌ master-agents/ directory missing"; exit 1; }
+          test -d commands || { echo "❌ commands/ directory missing"; exit 1; }
+          test -d examples || { echo "❌ examples/ directory missing"; exit 1; }
+          echo "✅ All required directories present"
+
+      - name: Verify required files
+        run: |
+          echo "Checking required files..."
+          test -f README.md || { echo "❌ README.md missing"; exit 1; }
+          test -f LICENSE || { echo "❌ LICENSE missing"; exit 1; }
+          test -f CONTRIBUTING.md || { echo "❌ CONTRIBUTING.md missing"; exit 1; }
+          test -f CHANGELOG.md || { echo "❌ CHANGELOG.md missing"; exit 1; }
+          test -f examples/CLAUDE.example.md || { echo "❌ examples/CLAUDE.example.md missing"; exit 1; }
+          test -f examples/custom-mode.md || { echo "❌ examples/custom-mode.md missing"; exit 1; }
+          echo "✅ All required files present"
+
+      - name: Verify agent files
+        run: |
+          echo "Checking agent files..."
+          test -f agents/master-coder.md || { echo "❌ agents/master-coder.md missing"; exit 1; }
+          test -f agents/master-researcher.md || { echo "❌ agents/master-researcher.md missing"; exit 1; }
+          test -f agents/master-architect.md || { echo "❌ agents/master-architect.md missing"; exit 1; }
+          test -f agents/master-workflow.md || { echo "❌ agents/master-workflow.md missing"; exit 1; }
+          echo "✅ All agent files present"
+
+      - name: Verify master-agents modes
+        run: |
+          echo "Checking master-agents mode directories..."
+          test -d master-agents/coder || { echo "❌ master-agents/coder/ missing"; exit 1; }
+          test -d master-agents/researcher || { echo "❌ master-agents/researcher/ missing"; exit 1; }
+          test -d master-agents/architect || { echo "❌ master-agents/architect/ missing"; exit 1; }
+          test -d master-agents/workflow || { echo "❌ master-agents/workflow/ missing"; exit 1; }
+          echo "✅ All master-agent mode directories present"
+
+      - name: Count GSD commands
+        run: |
+          echo "Counting GSD commands..."
+          CORE_COUNT=$(find commands/gsd -maxdepth 1 -name "*.md" -type f | wc -l)
+          EXTRA_COUNT=$(find commands/gsd/extras -name "*.md" -type f | wc -l)
+          TOTAL=$((CORE_COUNT + EXTRA_COUNT))
+          echo "Core commands: $CORE_COUNT"
+          echo "Extra commands: $EXTRA_COUNT"
+          echo "Total commands: $TOTAL"
+          if [ "$TOTAL" -ne 27 ]; then
+            echo "❌ Expected 27 commands, found $TOTAL"
+            exit 1
+          fi
+          echo "✅ Command count matches (27 total)"
+
+      - name: Verify GSD core commands
+        run: |
+          echo "Checking GSD core commands..."
+          test -f commands/gsd/new-project.md || { echo "❌ new-project.md missing"; exit 1; }
+          test -f commands/gsd/plan-phase.md || { echo "❌ plan-phase.md missing"; exit 1; }
+          test -f commands/gsd/execute-plan.md || { echo "❌ execute-plan.md missing"; exit 1; }
+          test -f commands/gsd/progress.md || { echo "❌ progress.md missing"; exit 1; }
+          test -f commands/gsd/verify-work.md || { echo "❌ verify-work.md missing"; exit 1; }
+          test -f commands/gsd/help.md || { echo "❌ help.md missing"; exit 1; }
+          echo "✅ All core GSD commands present"
+
+  yaml-validation:
+    name: YAML Front Matter Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Validate agent YAML front matter
+        run: |
+          echo "Validating agent files..."
+          for file in agents/*.md; do
+            echo "Checking $file..."
+            # Extract YAML front matter (between --- markers)
+            if ! sed -n '/^---$/,/^---$/p' "$file" | head -n -1 | tail -n +2 | yq eval '.' - > /dev/null 2>&1; then
+              echo "❌ Invalid YAML front matter in $file"
+              exit 1
+            fi
+          done
+          echo "✅ All agent YAML front matter is valid"
+
+      - name: Validate GSD command YAML front matter
+        run: |
+          echo "Validating GSD command files..."
+          for file in $(find commands/gsd -name "*.md" -type f); do
+            echo "Checking $file..."
+            # Extract YAML front matter
+            if ! sed -n '/^---$/,/^---$/p' "$file" | head -n -1 | tail -n +2 | yq eval '.' - > /dev/null 2>&1; then
+              echo "❌ Invalid YAML front matter in $file"
+              exit 1
+            fi
+          done
+          echo "✅ All GSD command YAML front matter is valid"
+
+  consistency-check:
+    name: Documentation Consistency Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check for broken internal references
+        run: |
+          echo "Checking for broken internal file references..."
+          # Find all markdown files
+          for file in $(find . -name "*.md" -type f | grep -v ".git"); do
+            echo "Checking $file for internal references..."
+            # Look for file paths that should exist
+            # This is a basic check - might need refinement
+            grep -oP '\]\([^http][^)]+\)' "$file" | sed 's/](\(.*\))/\1/' | while read -r ref; do
+              # Remove anchors
+              ref_path=$(echo "$ref" | cut -d'#' -f1)
+              if [ -n "$ref_path" ] && [ ! -f "$ref_path" ] && [ ! -d "$ref_path" ]; then
+                echo "⚠️  Potentially broken reference in $file: $ref_path"
+              fi
+            done
+          done
+          echo "✅ Internal reference check complete"
+
+      - name: Verify README command count
+        run: |
+          echo "Verifying README matches actual command count..."
+          if ! grep -q "27 commands" README.md && ! grep -q "27 Commands" README.md; then
+            echo "⚠️  Warning: README may not mention 27 commands"
+          fi
+          echo "✅ Command count verification complete"
