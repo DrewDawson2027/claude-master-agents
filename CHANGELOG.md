@@ -110,6 +110,11 @@ If you had been relying on automatic learning behavior:
 
 ### Known Issues
 - Some GSD commands reference `~/.claude/get-shit-done/` external files that are not included in this repository. Commands work without these files, but some advanced features may require manual setup.
+- Three reference cards are referenced but not yet implemented:
+  - `master-agents/architect/refs/sql-optimization.md`
+  - `master-agents/researcher/refs/data-storytelling.md`
+  - `master-agents/researcher/refs/kpi-dashboards.md`
+  These will be added in a future release.
 
 [Unreleased]: https://github.com/DrewDawson2027/claude-master-agents/compare/v1.0.0...HEAD
 [1.0.0]: https://github.com/DrewDawson2027/claude-master-agents/releases/tag/v1.0.0
