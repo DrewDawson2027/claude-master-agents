@@ -60,9 +60,7 @@ claude-master-agents/
 │   │   ├── database-design.md
 │   │   ├── api-design.md
 │   │   ├── system-design.md
-│   │   ├── frontend-design.md
-│   │   └── refs/
-│   │       └── sql-optimization.md
+│   │   └── frontend-design.md
 │   └── workflow/
 │       ├── gsd-exec-mode.md
 │       ├── feature-mode.md
@@ -76,7 +74,7 @@ claude-master-agents/
 │       ├── progress.md
 │       ├── verify-work.md
 │       ├── help.md
-│       └── extras/             # 22 advanced commands
+│       └── extras/             # 21 advanced commands
 ├── agents/                     # Agent definition files
 ├── examples/
 │   ├── CLAUDE.example.md       # Template CLAUDE.md with dispatch rules
@@ -157,7 +155,7 @@ GSD creates hierarchical project plans optimized for solo agentic development.
 /gsd:progress             # Check status, get next steps
 ```
 
-22 additional advanced commands are available in `commands/gsd/extras/` for roadmap management, milestone tracking, debugging, todo management, and more.
+21 additional advanced commands are available in `commands/gsd/extras/` for roadmap management, milestone tracking, debugging, todo management, and more.
 
 ## Token Management
 
