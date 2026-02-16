@@ -13,6 +13,9 @@ on:
       - '.github/workflows/markdown-links.yml'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   markdown-link-check:
     runs-on: ubuntu-latest
