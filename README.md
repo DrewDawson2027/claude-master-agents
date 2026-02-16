@@ -1,165 +1,150 @@
 # Claude Master Agents
 
-A framework of specialized AI agents for Claude Code with automatic task detection and mode routing. Four master agents cover coding, research, architecture, and workflow — each with domain-specific modes and reference cards.
+**Claude Code is powerful but unstructured. It treats every task the same — no project management, no specialized expertise, no memory of what approach works best for what kind of work.**
 
-## How It Works
+This framework fixes that with two things:
 
-```mermaid
-graph TD
-    U[User: 'review this PR'] --> D{Keyword Detection}
-    D -->|review, audit, PR| MC[master-coder]
-    D -->|research, find out| MR[master-researcher]
-    D -->|design, schema, API| MA[master-architect]
-    D -->|commit, execute, gsd| MW[master-workflow]
+1. **4 master agents** that auto-detect what you're doing and load specialized instructions (coding, research, architecture, workflow)
+2. **GSD (Get Shit Done)** — a 27-command project management system built for solo agentic development. No Jira. No tickets. Just phases, plans, and execution.
 
-    MC --> RM[review-mode.md]
-    MC --> BM[build-mode.md]
-    MC --> DM[debug-mode.md]
-    MC --> RF[refactor-mode.md]
+## GSD: Project Management for AI-Assisted Development
 
-    RM --> RC1[ref: auth-patterns.md]
-    RM --> RC2[ref: testing-py.md]
-    RM --> RC3[ref: error-handling.md]
-```
-
-1. User says something like "review this PR" or "fix the login bug"
-2. CLAUDE.md trigger rules detect keywords and select the right master agent
-3. The agent loads its mode file (e.g., `review-mode.md`) with specialized instructions
-4. Mode files reference domain-specific cards (e.g., `refs/auth-patterns.md`) as needed
-
-## The Four Master Agents
-
-| Agent | Modes | Ref Cards | Triggers |
-|-------|-------|-----------|----------|
-| **master-coder** | build, debug, review, refactor | 14 (auth, testing, design, error handling, git, JS/TS, Python, etc.) | "build/create/implement", "fix/debug/error", "review/audit/PR", "simplify/refactor" |
-| **master-researcher** | academic, market, technical, general | — | "research/find out", "competitor/market", "paper/study", "docs/how to use" |
-| **master-architect** | database, api, system, frontend | 1 (sql-optimization) | "design/architect/schema", "database/SQL", "API/REST/GraphQL", "system design" |
-| **master-workflow** | gsd-exec, feature, git, autonomous | — | "/gsd:", "commit/push/PR", "new feature", "autonomous/vibe code" |
-
-## Directory Structure
+Nothing like this exists for Claude Code. GSD gives you structured project lifecycle management — from initial brief through phased execution to verification.
 
 ```
-claude-master-agents/
-├── master-agents/
-│   ├── coder/
-│   │   ├── build-mode.md       # Autonomous feature development
-│   │   ├── debug-mode.md       # Systematic debugging
-│   │   ├── review-mode.md      # 7-dimension code review
-│   │   ├── refactor-mode.md    # Code simplification
-│   │   └── refs/               # 14 domain reference cards
-│   │       ├── auth-patterns.md
-│   │       ├── testing-py.md
-│   │       ├── design-principles.md
-│   │       └── ... (11 more)
-│   ├── researcher/
-│   │   ├── academic-mode.md
-│   │   ├── market-mode.md
-│   │   ├── technical-mode.md
-│   │   └── general-mode.md
-│   ├── architect/
-│   │   ├── database-design.md
-│   │   ├── api-design.md
-│   │   ├── system-design.md
-│   │   └── frontend-design.md
-│   └── workflow/
-│       ├── gsd-exec-mode.md
-│       ├── feature-mode.md
-│       ├── git-mode.md
-│       └── autonomous-mode.md
-├── commands/
-│   └── gsd/                    # 6 core GSD commands
-│       ├── new-project.md
-│       ├── plan-phase.md
-│       ├── execute-plan.md
-│       ├── progress.md
-│       ├── verify-work.md
-│       ├── help.md
-│       └── extras/             # 21 advanced commands
-├── agents/                     # Agent definition files
-├── examples/
-│   ├── CLAUDE.example.md       # Template CLAUDE.md with dispatch rules
-│   └── custom-mode.md          # How to write your own mode
-└── README.md
+/gsd:new-project              # Interactive project setup → creates .planning/
+/gsd:plan-phase 1             # Claude creates detailed execution plan
+/gsd:execute-plan PLAN.md     # Claude executes the plan step by step
+/gsd:progress                 # Progress bar, next steps, routing
+/gsd:verify-work              # Guided acceptance testing
 ```
+
+### What GSD Creates
+
+```
+your-project/
+└── .planning/
+    ├── PROJECT.md             # Brief, config, constraints
+    ├── ROADMAP.md             # Milestone → phase breakdown
+    ├── phases/
+    │   ├── 01-foundation/
+    │   │   ├── 01-01-PLAN.md  # Detailed execution plan
+    │   │   └── 01-02-PLAN.md
+    │   └── 02-features/
+    │       └── 02-01-PLAN.md
+    ├── todos/                 # Captured ideas and tasks
+    └── issues/                # Deferred problems
+```
+
+### 27 Commands
+
+**6 core** — the daily workflow:
+
+| Command | What It Does |
+|---------|-------------|
+| `/gsd:new-project` | Initialize project with brief, config, `.planning/` structure |
+| `/gsd:plan-phase` | Create detailed execution plan for a phase |
+| `/gsd:execute-plan` | Execute a PLAN.md with sequential task completion |
+| `/gsd:progress` | Check status, show progress, route to next action |
+| `/gsd:verify-work` | Guide manual acceptance testing |
+| `/gsd:help` | Full command reference |
+
+**21 advanced** — roadmap management, debugging, context switching:
+
+| Category | Commands |
+|----------|---------|
+| Roadmap | `create-roadmap`, `add-phase`, `remove-phase`, `insert-phase` |
+| Milestones | `discuss-milestone`, `new-milestone`, `complete-milestone` |
+| Phase work | `discuss-phase`, `research-phase`, `execute-phase`, `list-phase-assumptions` |
+| Task management | `add-todo`, `check-todos`, `consider-issues` |
+| Context | `pause-work`, `resume-work`, `resume-task`, `status` |
+| Debugging | `debug`, `plan-fix` |
+| Codebase | `map-codebase` |
+
+## 4 Master Agents
+
+Each agent auto-detects task type from your prompt and loads the right mode:
+
+### master-coder
+Detects: "build", "fix", "review", "refactor"
+
+| Mode | What It Does | Reference Cards |
+|------|-------------|-----------------|
+| build | Autonomous feature development | modern-js, nodejs-backend, python-frameworks |
+| debug | Systematic root cause analysis | error-handling, testing-py, testing-js |
+| review | 7-dimension code review | auth-patterns, design-principles, e2e-testing |
+| refactor | Code simplification | monorepo, typescript-types, git-advanced |
+
+14 domain reference cards covering auth patterns, async Python, error handling, testing (JS + Python), TypeScript types, monorepo patterns, and more.
+
+### master-researcher
+Detects: "research", "competitor", "paper", "docs"
+
+| Mode | What It Does |
+|------|-------------|
+| academic | Multi-source research with citation tracking |
+| market | Competitor and market intelligence |
+| technical | Documentation and API research |
+| general | General-purpose research synthesis |
+
+### master-architect
+Detects: "design", "schema", "API", "system"
+
+| Mode | What It Does |
+|------|-------------|
+| database | Schema design, normalization, query optimization |
+| api | REST/GraphQL API design |
+| system | Distributed systems architecture |
+| frontend | Component architecture, state management |
+
+### master-workflow
+Detects: "/gsd:", "commit", "new feature", "autonomous"
+
+| Mode | What It Does |
+|------|-------------|
+| gsd-exec | GSD plan execution with verification |
+| feature | Spec-driven feature development |
+| git | Commit, branch, PR workflows |
+| autonomous | Vibe coding — minimal steering |
 
 ## Installation
 
-1. Copy the contents to your `~/.claude/` directory:
-
 ```bash
+git clone https://github.com/DrewDawson2027/claude-master-agents.git
+cd claude-master-agents
+
+# Copy to Claude Code config
 cp -r master-agents/ ~/.claude/master-agents/
 cp -r commands/ ~/.claude/commands/
 cp -r agents/ ~/.claude/agents/
 ```
 
-2. Add the dispatch rules to your `~/.claude/CLAUDE.md` (see `examples/CLAUDE.example.md` for the full template).
+Then add dispatch rules to your `~/.claude/CLAUDE.md`. See `examples/CLAUDE.example.md` for the full template.
 
-## Adding Your Own Mode
-
-Create a new `.md` file in any agent directory:
+## Create Your Own Mode
 
 ```markdown
-# My Custom Mode — One-Line Description
+# My Custom Mode
 
 You are an expert at [domain]. Follow this protocol exactly.
 
-## Embedded Knowledge
-- List the skills/knowledge this mode combines
-- Reference any ref cards: "load refs/my-card.md when doing X"
-
 ## Protocol
-
 ### Phase 1: Understand
-1. Read the task completely
-2. Identify files that need to change
+1. Read the task
+2. Identify files to change
 3. Check existing patterns
 
 ### Phase 2: Execute
 1. Follow existing conventions
 2. Write tests for new behavior
 3. Verify everything works
-
-## Rules
-- Rule 1
-- Rule 2
 ```
 
-Then add a trigger to your CLAUDE.md:
-```markdown
-- **my-agent**: "keyword1/keyword2" (my-mode)
-```
-
-See `examples/custom-mode.md` for a complete annotated template.
-
-## GSD Commands (Get Shit Done)
-
-GSD creates hierarchical project plans optimized for solo agentic development.
-
-### Core Commands
-
-| Command | What It Does |
-|---------|-------------|
-| `/gsd:new-project` | Initialize a project with brief, config, and `.planning/` structure |
-| `/gsd:plan-phase <n>` | Create a detailed execution plan for phase N |
-| `/gsd:execute-plan <path>` | Execute a PLAN.md file with sequential task completion |
-| `/gsd:progress` | Check project status, show progress bar, route to next action |
-| `/gsd:verify-work` | Guide manual acceptance testing of recently built features |
-| `/gsd:help` | Show the full command reference |
-
-### Quick Workflow
-
-```
-/gsd:new-project          # Set up project brief
-/gsd:plan-phase 1         # Plan first phase
-/gsd:execute-plan .planning/phases/01-foundation/01-01-PLAN.md
-/gsd:progress             # Check status, get next steps
-```
-
-21 additional advanced commands are available in `commands/gsd/extras/` for roadmap management, milestone tracking, debugging, todo management, and more.
+See `examples/custom-mode.md` for an annotated template.
 
 ## Token Management
 
-The framework includes a token management system via CLAUDE.md rules:
+The framework includes a tool ladder to minimize token usage:
 
 | Level | Tool | Cost | When |
 |-------|------|------|------|
@@ -168,7 +153,7 @@ The framework includes a token management system via CLAUDE.md rules:
 | 3 | 2 agents parallel | ~80-120k | Truly separate areas (rare) |
 | 4 | Plan agent | ~30-50k | Architecture decisions |
 
-The companion [claude-code-toolkit](https://github.com/DrewDawson2027/claude-code-toolkit) enforces these limits mechanically via the `token-guard.py` hook.
+The companion [claude-code-toolkit](https://github.com/DrewDawson2027/claude-code-toolkit) enforces these limits mechanically via a PreToolUse hook. Together, the two projects give you structured workflows with automatic cost control.
 
 ## License
 
