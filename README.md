@@ -107,6 +107,150 @@ Detects: "/gsd:", "commit", "new feature", "autonomous"
 | git | Commit, branch, PR workflows |
 | autonomous | Vibe coding — minimal steering |
 
+## QUICKSTART
+
+### 1. Install (2 minutes)
+
+```bash
+# Clone the repository
+git clone https://github.com/DrewDawson2027/claude-master-agents.git
+cd claude-master-agents
+
+# Copy to Claude Code config directory
+cp -r master-agents/ ~/.claude/master-agents/
+cp -r commands/ ~/.claude/commands/
+cp -r agents/ ~/.claude/agents/
+
+# Add dispatch rules to your Claude config
+cat examples/CLAUDE.example.md >> ~/.claude/CLAUDE.md
+```
+
+### 2. Verify Installation
+
+Open Claude Code and verify the setup:
+```
+/help
+```
+
+You should see the GSD commands listed. If not, restart Claude Code.
+
+### 3. First Project (3 minutes)
+
+Create a test project to see the system in action:
+
+```
+Let's build a simple todo API
+```
+
+Claude will detect "build" and automatically spawn `master-coder` in build mode. Expected output:
+
+```
+Spawning master-coder (build mode)
+Estimated cost: ~40-60k tokens
+
+[Agent analyzes requirements and creates implementation plan]
+```
+
+Or use GSD for structured project management:
+
+```
+/gsd:new-project
+```
+
+Expected output:
+- Interactive questions about your project
+- Creation of `.planning/PROJECT.md`
+- Project config in `.planning/config.json`
+
+Then:
+```
+/gsd:create-roadmap
+/gsd:plan-phase 1
+/gsd:execute-plan phases/01-foundation/01-01-PLAN.md
+```
+
+## 5-Minute Demo Walkthrough
+
+### Scenario: Build a REST API for a Todo App
+
+**Step 1: Initialize the project**
+
+You: `/gsd:new-project`
+
+Claude asks questions:
+- "What do you want to build?" → "A REST API for a todo app with tasks and users"
+- "If you could only nail one thing, what would it be?" → "Clean API design"
+- "What's explicitly NOT in v1?" → "No mobile app, no real-time updates"
+- Mode preference → "Interactive"
+- Depth preference → "Standard"
+
+**Result:** `.planning/` structure created:
+```
+.planning/
+├── PROJECT.md          # Your requirements and constraints
+└── config.json         # Workflow preferences
+```
+
+**Step 2: Create roadmap**
+
+You: `/gsd:create-roadmap`
+
+**Result:** Claude generates milestone-based roadmap:
+```
+.planning/
+├── PROJECT.md
+├── ROADMAP.md          # ← New: Milestones and phases
+├── config.json
+└── phases/
+    ├── 01-foundation/
+    ├── 02-api-core/
+    └── 03-testing/
+```
+
+**Step 3: Plan first phase**
+
+You: `/gsd:plan-phase 1`
+
+**Result:** Detailed execution plan:
+```
+.planning/phases/01-foundation/
+└── 01-01-PLAN.md       # ← Tasks: setup, dependencies, project structure
+```
+
+**Step 4: Execute the plan**
+
+You: `/gsd:execute-plan phases/01-foundation/01-01-PLAN.md`
+
+Claude executes each task:
+- Creates project structure
+- Installs dependencies
+- Sets up basic configuration
+- Commits each change
+
+**Step 5: Check progress**
+
+You: `/gsd:progress`
+
+Output shows:
+```
+📊 Project: Todo API
+Phase 1/3 (Foundation): ████████░░ 80% complete
+Next: Continue with 01-02-PLAN.md
+```
+
+**Step 6: Verify work**
+
+You: `/gsd:verify-work`
+
+Claude guides you through testing:
+- Run the dev server
+- Test endpoints
+- Check error handling
+
+### What You Get
+
+This structured approach creates an audit trail of decisions and a clear execution path. Every choice is documented in `.planning/`, and every phase builds on validated previous work.
+
 ## Installation
 
 ```bash
