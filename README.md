@@ -170,7 +170,7 @@ The framework includes a token management system via CLAUDE.md rules:
 | 3 | 2 agents parallel | ~80-120k | Truly separate areas (rare) |
 | 4 | Plan agent | ~30-50k | Architecture decisions |
 
-The companion [claude-code-toolkit](https://github.com/YOUR_USERNAME/claude-code-toolkit) enforces these limits mechanically via the `token-guard.py` hook.
+The companion [claude-code-toolkit](https://github.com/DrewDawson2027/claude-code-toolkit) enforces these limits mechanically via the `token-guard.py` hook.
 
 ## License
 
