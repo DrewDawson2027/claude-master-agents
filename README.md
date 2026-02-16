@@ -292,10 +292,17 @@ The framework includes a tool ladder to minimize token usage:
 
 | Level | Tool | Cost | When |
 |-------|------|------|------|
-| 1 | Grep/Read | ~1-5k | Know what you're looking for |
-| 2 | Single agent (Sonnet) | ~40-60k | Need architecture understanding |
-| 3 | 2 agents parallel | ~80-120k | Truly separate areas (rare) |
-| 4 | Plan agent | ~30-50k | Architecture decisions |
+| 1 | Grep | ~1-2k | Know what you're looking for |
+| 2 | Grep → Read | ~5-15k | Need context around matches |
+| 3 | Single Explore (Sonnet) | ~40-60k | Need architecture understanding |
+| 4 | 2 Explores parallel | ~80-120k | TRULY separate areas (RARE) |
+| 5 | Plan agent (Sonnet) | ~30-50k | Architecture decisions |
+
+**Key Principles:**
+- Stop at the first level that works
+- Use Grep before spawning agents
+- Merge overlapping queries into one agent
+- Reserve parallel agents for truly independent work
 
 The companion [claude-code-toolkit](https://github.com/DrewDawson2027/claude-code-toolkit) enforces these limits mechanically via a PreToolUse hook. Together, the two projects give you structured workflows with automatic cost control.
 
