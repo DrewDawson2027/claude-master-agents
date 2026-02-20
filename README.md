@@ -121,6 +121,18 @@ cp -r agents/ ~/.claude/agents/
 
 Then add dispatch rules to your `~/.claude/CLAUDE.md`. See `examples/CLAUDE.example.md` for the full template.
 
+### Prerequisite: GSD Workflow Assets
+
+GSD commands in this repo reference workflow/template files under `~/.claude/get-shit-done/`. Install the companion toolkit first:
+
+- [claude-code-toolkit](https://github.com/DrewDawson2027/claude-code-toolkit)
+
+Quick check:
+
+```bash
+test -d ~/.claude/get-shit-done && echo "OK: get-shit-done installed" || echo "Missing: install claude-code-toolkit"
+```
+
 ## Create Your Own Mode
 
 ```markdown

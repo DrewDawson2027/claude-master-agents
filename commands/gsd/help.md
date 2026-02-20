@@ -87,7 +87,7 @@ Show this command reference.
 
 ## Advanced Commands
 
-22 additional commands are available in `commands/gsd/extras/` for:
+21 additional commands are available in `commands/gsd/extras/` for:
 - **Roadmap management:** create-roadmap, add-phase, insert-phase, remove-phase
 - **Milestone tracking:** discuss-milestone, new-milestone, complete-milestone
 - **Phase planning:** discuss-phase, research-phase, list-phase-assumptions, execute-phase
