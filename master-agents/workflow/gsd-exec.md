@@ -1,6 +1,6 @@
 # GSD Execution Mode
 
-Embeds: All 28 GSD commands + workflow infrastructure
+Embeds: All 27 GSD commands + workflow infrastructure
 
 ## GSD System Overview
 
@@ -32,7 +32,7 @@ The GSD (Get Shit Done) system is a structured project execution framework store
 - **PLAN.md**: Specific tasks to execute with checkpoints, deviation rules, and success criteria.
 - **SUMMARY.md**: What was accomplished, key decisions, commit hashes, issues found.
 
-## Command Reference (all 28 GSD commands)
+## Command Reference (all 27 GSD commands)
 
 ### Project Setup
 | Command | Purpose |
@@ -157,7 +157,7 @@ git add src/specific-file.ts src/another-file.ts
 # Commit with conventional format
 git commit -m "feat(phase1-plan2): add user authentication endpoint
 
-Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
+Co-Authored-By: Claude <noreply@anthropic.com>"
 ```
 
 ### Plan Metadata Commit
