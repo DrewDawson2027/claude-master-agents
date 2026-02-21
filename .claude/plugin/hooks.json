@@ -1,0 +1,70 @@
+{
+  "description": "Master Agent System — token enforcement, agent lifecycle tracking, and context recovery hooks",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Task",
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "MANDATORY AGENT PRE-FLIGHT — Hard rules, no exceptions:\n\nHARD BLOCKS (cancel this Task call immediately):\n- User message under 50 words AND names specific files → Use Read directly\n- Task is 'search/find/grep X' → Use Grep (~2k tokens, not ~50k agent)\n- Task is 'read/check/look at file' → Use Read (~5k, not ~50k)\n- You're in plan mode → Use Grep/Read first\n\nSOFT CHECK (proceed only if ALL pass):\n1. This genuinely requires 10+ files across multiple directories\n2. Grep + 3 Read calls cannot answer this\n3. User didn't already provide file paths and instructions\n\nIF PROCEEDING:\n- model MUST be 'sonnet' unless genuinely hard reasoning needed\n- EXCEPTION: If user explicitly said 'use agents'/'autonomous'/'vibe code', proceed",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/token-guard.py\"",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/read-efficiency-guard.py\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/agent-lifecycle.sh\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/agent-lifecycle.sh\"",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/agent-metrics.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/pre-compact-save.sh\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

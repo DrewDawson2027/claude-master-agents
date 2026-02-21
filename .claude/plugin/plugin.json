@@ -1,0 +1,17 @@
+{
+  "name": "master-agent-system",
+  "description": "Production-grade multi-agent orchestration with on-demand mode loading, token enforcement, and lifecycle observability. 4 master agents, 17 modes, 18 reference cards, 7-rule mechanical enforcement.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Drew Dawson"
+  },
+  "homepage": "",
+  "license": "MIT",
+  "tags": [
+    "agents",
+    "orchestration",
+    "token-management",
+    "multi-agent",
+    "governance"
+  ]
+}
