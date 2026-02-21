@@ -104,6 +104,34 @@ Registry of all modes, reference cards, keywords, and purposes. Source of truth 
 
 ---
 
+## Lifecycle Hooks
+
+| Hook Event | Script | Purpose |
+|-----------|--------|---------|
+| SubagentStart | `agent-lifecycle.sh` | Logs agent spawn timestamp for duration tracking |
+| SubagentStop | `agent-lifecycle.sh` | Logs agent completion with duration calculation |
+| PreCompact | `pre-compact-save.sh` | Saves session state before context compaction |
+| PreToolUse (Task) | `token-guard.py` | Enforces agent caps, necessity scoring, cooldowns |
+| PreToolUse (Read) | `read-efficiency-guard.py` | Blocks duplicate/sequential reads |
+| SessionStart | `session-register.sh` | Registers session, bootstraps cache |
+| SessionStart | `self-heal.py` | Validates 60+ checks, auto-repairs config |
+
+Metrics log: `~/.claude/hooks/session-state/agent-metrics.jsonl`
+Compaction log: `~/.claude/session-cache/compaction-log.jsonl`
+
+---
+
+## Prompt Caching Architecture
+
+Agent system prompts are the stable prefix cached by Claude Code's internal prompt caching. Mode files load via the Read tool (tool results, not system prompt), so they never break the cache prefix. This is optimal:
+
+- System prompt (~65-80 lines) = **cached** across invocations
+- Mode file (~100-140 lines) = loaded via Read, **not** in cache prefix
+- Reference cards = loaded via Read on demand, **not** in cache prefix
+- Total re-tokenized per spawn: only the mode file (~130 lines avg)
+
+---
+
 ## How to Extend
 
 ### Adding a new mode

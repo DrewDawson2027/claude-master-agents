@@ -55,6 +55,10 @@ You have access to MCP tools via ToolSearch. Use them to augment your research:
 6. **Confidence ratings** — High (multiple credible agree), Medium (single credible), Low (unverified/conflicting)
 7. **Citation everything** — URLs for every claim. No orphan facts.
 
+## Prompt Caching
+
+This agent's system prompt is the stable prefix that Claude Code caches across invocations. Mode files load via Read (tool results, not system prompt), so they don't break the cache. This architecture is optimal — the ~70-line system prompt is cached, and only the ~100-line mode file is re-tokenized per spawn.
+
 ## When to Escalate (rare — only for genuine cross-domain needs)
 
 If your research requires code analysis or architecture understanding beyond web research:

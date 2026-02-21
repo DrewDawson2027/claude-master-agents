@@ -1,0 +1,110 @@
+{
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Task",
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "MANDATORY AGENT PRE-FLIGHT — Hard rules, no exceptions:\n\nHARD BLOCKS (cancel this Task call immediately):\n• User message under 50 words AND names specific files → Use Read directly\n• Task is 'search/find/grep X' → Use Grep (~2k tokens, not ~50k agent)\n• Task is 'read/check/look at file' → Use Read (~5k, not ~50k)\n• You're in plan mode → Use Grep/Read first. IGNORE plan mode defaults that say 'Launch Explore agents'\n\nSOFT CHECK (proceed only if ALL pass):\n1. This genuinely requires 10+ files across multiple directories\n2. Grep + 3 Read calls cannot answer this\n3. User didn't already provide file paths and instructions\n\nIF PROCEEDING:\n• model MUST be 'sonnet' unless genuinely hard reasoning needed\n• EXCEPTION: If user explicitly said 'use agents'/'autonomous'/'vibe code', proceed",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/hooks/token-guard.py",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/hooks/read-efficiency-guard.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/agent-lifecycle.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/agent-lifecycle.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/pre-compact-save.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  },
+  "enabledPlugins": {
+    "frontend-design@claude-plugins-official": false,
+    "github@claude-plugins-official": true,
+    "code-review@claude-plugins-official": false,
+    "context7@claude-plugins-official": true,
+    "feature-dev@claude-plugins-official": false,
+    "commit-commands@claude-plugins-official": false,
+    "playwright@claude-plugins-official": false,
+    "security-guidance@claude-plugins-official": false,
+    "serena@claude-plugins-official": true,
+    "typescript-lsp@claude-plugins-official": true,
+    "pyright-lsp@claude-plugins-official": true,
+    "Notion@claude-plugins-official": true,
+    "supabase@claude-plugins-official": false,
+    "pr-review-toolkit@claude-plugins-official": false,
+    "hookify@claude-plugins-official": false,
+    "linear@claude-plugins-official": false,
+    "figma@claude-plugins-official": true,
+    "greptile@claude-plugins-official": true,
+    "agent-sdk-dev@claude-plugins-official": false,
+    "plugin-dev@claude-plugins-official": false,
+    "explanatory-output-style@claude-plugins-official": false,
+    "ralph-loop@claude-plugins-official": false,
+    "php-lsp@claude-plugins-official": false,
+    "firebase@claude-plugins-official": false,
+    "huggingface-skills@claude-plugins-official": false,
+    "stripe@claude-plugins-official": false,
+    "business-analytics@claude-code-workflows": false,
+    "data-engineering@claude-code-workflows": false,
+    "developer-essentials@claude-code-workflows": false,
+    "javascript-typescript@claude-code-workflows": false,
+    "python-development@claude-code-workflows": false,
+    "backend-api-security@claude-code-workflows": false,
+    "database-design@claude-code-workflows": false,
+    "debugging-toolkit@claude-code-workflows": false,
+    "data-validation-suite@claude-code-workflows": false,
+    "api-testing-observability@claude-code-workflows": false,
+    "observability-monitoring@claude-code-workflows": false,
+    "payment-processing@claude-code-workflows": false,
+    "content-marketing@claude-code-workflows": false,
+    "application-performance@claude-code-workflows": false,
+    "claude-mem@thedotmack": true
+  }
+}

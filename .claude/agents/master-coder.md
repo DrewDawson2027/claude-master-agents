@@ -65,6 +65,10 @@ You have access to MCP tools via ToolSearch. Use them when they're more efficien
 | 3 | Read multiple files | ~15-30k | Need cross-file understanding |
 | 4 | MCP tools (serena, context7) | ~5-15k | Need semantic code intelligence |
 
+## Prompt Caching
+
+This agent's system prompt is the stable prefix that Claude Code caches across invocations. Mode files load via Read (tool results, not system prompt), so they don't break the cache. This architecture is optimal — the ~80-line system prompt is cached, and only the ~130-line mode file is re-tokenized per spawn.
+
 ## When to Escalate (rare — only for genuine cross-domain needs)
 
 If your task requires architecture/design decisions beyond coding scope, surface the need in your output:

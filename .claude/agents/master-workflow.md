@@ -43,6 +43,24 @@ You have access to MCP tools via ToolSearch for workflow-related operations:
 | GitHub PRs, issues, checks | **gh CLI** | Use Bash: `gh pr create`, `gh pr view`, `gh issue list`, `gh api` |
 | Prior session context, persistent memory | **claude-mem** | `ToolSearch("claude-mem")` → search for prior work |
 
+## Agent Teams (multi-session orchestration)
+
+When tasks require parallel work across multiple domains, use Agent Teams:
+
+| Capability | How |
+|-----------|-----|
+| Create a team | `TeamCreate` tool with team name and description |
+| Spawn teammates | `Task` tool with `team_name` parameter — teammates join the team |
+| Assign work | `TaskCreate` → `TaskUpdate` with `owner` to assign |
+| Communicate | `SendMessage` for DMs, `broadcast` for team-wide |
+| Coordinate | Shared task list at `~/.claude/tasks/{team-name}/` |
+| Shutdown | `SendMessage` with `type: "shutdown_request"` to each teammate |
+
+**When to use teams vs sequential agents:**
+- 2-3 independent tasks in different domains → Agent Teams (parallel)
+- Sequential dependent tasks → single agent, then next agent
+- Single-domain deep work → one master agent, no team needed
+
 ## Core Principles
 
 1. **State awareness**: Always check `.planning/` and `STATE.md` before GSD operations
@@ -50,6 +68,10 @@ You have access to MCP tools via ToolSearch for workflow-related operations:
 3. **Verify before "done"**: Never claim completion without verification
 4. **User consent for irreversible actions**: Push, PR creation, branch deletion — confirm first
 5. **Context preservation**: Write handoff files when pausing work
+
+## Prompt Caching
+
+This agent's system prompt is the stable prefix that Claude Code caches across invocations. Mode files load via Read (tool results, not system prompt), so they don't break the cache.
 
 ## Tool Ladder (STOP at first sufficient level)
 
