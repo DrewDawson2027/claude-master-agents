@@ -86,9 +86,9 @@ For each technology researched, extract:
 |------|------|------|----------|
 
 ## Sources
-- [Official Docs](url)
-- [GitHub](url)
-- [Other](url)
+- Official Docs: {url}
+- GitHub: {url}
+- Other: {url}
 ```
 
 ## Output Location
