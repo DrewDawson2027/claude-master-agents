@@ -1,25 +1,122 @@
-# Claude Master Agents
+<div align="center">
+<h1>🤖 Claude Master Agents</h1>
+<h3>The structured intelligence layer Claude Code was missing.</h3>
+<p><strong>4 specialist agents. 27 workflow commands. Zero Jira.</strong></p>
+<p>
+  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+  <a href="https://github.com/DrewDawson2027/claude-master-agents/stargazers"><img src="https://img.shields.io/github/stars/DrewDawson2027/claude-master-agents?style=social" alt="Stars"></a>
+  <a href="https://github.com/DrewDawson2027/claude-master-agents/network/members"><img src="https://img.shields.io/github/forks/DrewDawson2027/claude-master-agents?style=social" alt="Forks"></a>
+  <a href="https://github.com/DrewDawson2027/claude-master-agents/commits"><img src="https://img.shields.io/github/last-commit/DrewDawson2027/claude-master-agents" alt="Last Commit"></a>
+</p>
+</div>
 
-**Claude Code is powerful but unstructured. It treats every task the same — no project management, no specialized expertise, no memory of what approach works best for what kind of work.**
+---
 
-This framework fixes that with two things:
+## 🔥 The Problem
 
-1. **4 master agents** that auto-detect what you're doing and load specialized instructions (coding, research, architecture, workflow)
-2. **GSD (Get Shit Done)** — a 27-command project management system built for solo agentic development. No Jira. No tickets. Just phases, plans, and execution.
+Claude Code is powerful — but completely flat.
 
-## GSD: Project Management for AI-Assisted Development
+> Every task gets the same treatment. No project memory. No specialized expertise. No structured lifecycle.  
+> You end up re-explaining context every session, burning tokens on exploration, and stitching together your own workflow from scratch.
 
-Nothing like this exists for Claude Code. GSD gives you structured project lifecycle management — from initial brief through phased execution to verification.
+**Claude Master Agents fixes all of that.**
 
+---
+
+## ⚡ What You Get
+
+Two things, working together:
+
+| | What | Why |
+|--|------|-----|
+| 🧠 | **4 Master Agents** | Auto-detect task type → load specialized instructions (code, research, architecture, workflow) |
+| 📋 | **GSD System** | 27-command project lifecycle manager — from brief to shipped, no tickets required |
+
+---
+
+## 🧠 The 4 Master Agents
+
+Each agent reads your prompt, detects the right mode, and loads specialist instructions automatically. No manual switching.
+
+<details>
+<summary><b>🛠️ master-coder</b> — Build · Debug · Review · Refactor</summary>
+
+**Auto-detects from:** `build`, `fix`, `review`, `refactor`
+
+| Mode | What It Does | Reference Cards |
+|------|-------------|-----------------|
+| `build` | Autonomous feature development | modern-js, nodejs-backend, python-frameworks |
+| `debug` | Systematic root cause analysis | error-handling, testing-py, testing-js |
+| `review` | 7-dimension code review | auth-patterns, design-principles, e2e-testing |
+| `refactor` | Code simplification & cleanup | monorepo, typescript-types, git-advanced |
+
+> Ships with **14 domain reference cards** — auth patterns, async Python, error handling, testing (JS + Python), TypeScript types, monorepo patterns, and more.
+
+</details>
+
+<details>
+<summary><b>🔬 master-researcher</b> — Academic · Market · Technical · General</summary>
+
+**Auto-detects from:** `research`, `competitor`, `paper`, `docs`
+
+| Mode | What It Does |
+|------|-------------|
+| `academic` | Multi-source research with citation tracking |
+| `market` | Competitor and market intelligence |
+| `technical` | Documentation and API research |
+| `general` | General-purpose research synthesis |
+
+</details>
+
+<details>
+<summary><b>🏗️ master-architect</b> — Database · API · System · Frontend</summary>
+
+**Auto-detects from:** `design`, `schema`, `API`, `system`
+
+| Mode | What It Does |
+|------|-------------|
+| `database` | Schema design, normalization, query optimization |
+| `api` | REST/GraphQL API design |
+| `system` | Distributed systems architecture |
+| `frontend` | Component architecture, state management |
+
+> Always produces **ADRs + Mermaid diagrams + trade-off tables**. Never single-option recommendations.
+
+</details>
+
+<details>
+<summary><b>🔄 master-workflow</b> — GSD · Feature · Git · Autonomous</summary>
+
+**Auto-detects from:** `/gsd:`, `commit`, `new feature`, `autonomous`
+
+| Mode | What It Does |
+|------|-------------|
+| `gsd-exec` | GSD plan execution with verification |
+| `feature` | Spec-driven feature development |
+| `git` | Commit, branch, PR workflows |
+| `autonomous` | Vibe coding — minimal steering |
+
+</details>
+
+---
+
+## 📋 GSD: Project Management for AI-Assisted Development
+
+> Nothing like this exists for Claude Code.
+
+GSD gives you a full project lifecycle — from brief to verified ship — in a single `.planning/` folder. No external tools. No dashboards. Just structured phases Claude executes.
+
+### The 5 Core Commands
+
+```bash
+/gsd:new-project              # Interactive setup → creates .planning/ structure
+/gsd:plan-phase 1             # Claude writes a detailed execution plan
+/gsd:execute-plan PLAN.md     # Claude executes the plan, task by task
+/gsd:progress                 # Progress bar, status, next action routing
+/gsd:verify-work              # Guided acceptance testing before "done"
 ```
-/gsd:new-project              # Interactive project setup → creates .planning/
-/gsd:plan-phase 1             # Claude creates detailed execution plan
-/gsd:execute-plan PLAN.md     # Claude executes the plan step by step
-/gsd:progress                 # Progress bar, next steps, routing
-/gsd:verify-work              # Guided acceptance testing
-```
 
-### What GSD Creates
+### What Lives in `.planning/`
 
 ```
 your-project/
@@ -36,9 +133,12 @@ your-project/
     └── issues/                # Deferred problems
 ```
 
-### 27 Commands
+### All 27 Commands
 
-**6 core** — the daily workflow:
+<details>
+<summary>View full command reference</summary>
+
+**6 core — the daily workflow:**
 
 | Command | What It Does |
 |---------|-------------|
@@ -49,7 +149,7 @@ your-project/
 | `/gsd:verify-work` | Guide manual acceptance testing |
 | `/gsd:help` | Full command reference |
 
-**21 advanced** — roadmap management, debugging, context switching:
+**21 advanced — roadmap management, debugging, context switching:**
 
 | Category | Commands |
 |----------|---------|
@@ -61,79 +161,40 @@ your-project/
 | Debugging | `debug`, `plan-fix` |
 | Codebase | `map-codebase` |
 
-## 4 Master Agents
+</details>
 
-Each agent auto-detects task type from your prompt and loads the right mode:
+---
 
-### master-coder
-Detects: "build", "fix", "review", "refactor"
-
-| Mode | What It Does | Reference Cards |
-|------|-------------|-----------------|
-| build | Autonomous feature development | modern-js, nodejs-backend, python-frameworks |
-| debug | Systematic root cause analysis | error-handling, testing-py, testing-js |
-| review | 7-dimension code review | auth-patterns, design-principles, e2e-testing |
-| refactor | Code simplification | monorepo, typescript-types, git-advanced |
-
-14 domain reference cards covering auth patterns, async Python, error handling, testing (JS + Python), TypeScript types, monorepo patterns, and more.
-
-### master-researcher
-Detects: "research", "competitor", "paper", "docs"
-
-| Mode | What It Does |
-|------|-------------|
-| academic | Multi-source research with citation tracking |
-| market | Competitor and market intelligence |
-| technical | Documentation and API research |
-| general | General-purpose research synthesis |
-
-### master-architect
-Detects: "design", "schema", "API", "system"
-
-| Mode | What It Does |
-|------|-------------|
-| database | Schema design, normalization, query optimization |
-| api | REST/GraphQL API design |
-| system | Distributed systems architecture |
-| frontend | Component architecture, state management |
-
-### master-workflow
-Detects: "/gsd:", "commit", "new feature", "autonomous"
-
-| Mode | What It Does |
-|------|-------------|
-| gsd-exec | GSD plan execution with verification |
-| feature | Spec-driven feature development |
-| git | Commit, branch, PR workflows |
-| autonomous | Vibe coding — minimal steering |
-
-## Installation
+## 🚀 Installation
 
 ```bash
 git clone https://github.com/DrewDawson2027/claude-master-agents.git
 cd claude-master-agents
 
-# Copy to Claude Code config
+# Drop into your Claude Code config
 cp -r master-agents/ ~/.claude/master-agents/
-cp -r commands/ ~/.claude/commands/
-cp -r agents/ ~/.claude/agents/
+cp -r commands/      ~/.claude/commands/
+cp -r agents/        ~/.claude/agents/
 ```
 
-Then add dispatch rules to your `~/.claude/CLAUDE.md`. See `examples/CLAUDE.example.md` for the full template.
+Then add the dispatch rules to your `~/.claude/CLAUDE.md`. See [`examples/CLAUDE.example.md`](examples/CLAUDE.example.md) for the ready-to-paste template.
 
-### Prerequisite: GSD Workflow Assets
+### ⚠️ Prerequisite: GSD Workflow Assets
 
-GSD commands in this repo reference workflow/template files under `~/.claude/get-shit-done/`. Install the companion toolkit first:
+GSD commands reference template files under `~/.claude/get-shit-done/`. Install the companion toolkit first:
 
-- [claude-code-toolkit](https://github.com/DrewDawson2027/claude-code-toolkit)
-
-Quick check:
+👉 **[claude-code-toolkit](https://github.com/DrewDawson2027/claude-code-toolkit)**
 
 ```bash
-test -d ~/.claude/get-shit-done && echo "OK: get-shit-done installed" || echo "Missing: install claude-code-toolkit"
+# Verify it's installed
+test -d ~/.claude/get-shit-done && echo "✅ get-shit-done installed" || echo "❌ Missing — install claude-code-toolkit first"
 ```
 
-## Create Your Own Mode
+---
+
+## 🧩 Build Your Own Mode
+
+Drop a custom mode into any agent in under 5 minutes:
 
 ```markdown
 # My Custom Mode
@@ -152,21 +213,37 @@ You are an expert at [domain]. Follow this protocol exactly.
 3. Verify everything works
 ```
 
-See `examples/custom-mode.md` for an annotated template.
+See [`examples/custom-mode.md`](examples/custom-mode.md) for a fully annotated template.
 
-## Token Management
+---
 
-The framework includes a tool ladder to minimize token usage:
+## 💰 Token Management
 
-| Level | Tool | Cost | When |
-|-------|------|------|------|
-| 1 | Grep/Read | ~1-5k | Know what you're looking for |
-| 2 | Single agent (Sonnet) | ~40-60k | Need architecture understanding |
-| 3 | 2 agents parallel | ~80-120k | Truly separate areas (rare) |
-| 4 | Plan agent | ~30-50k | Architecture decisions |
+The framework enforces a **Tool Ladder** to minimize wasted tokens:
 
-The companion [claude-code-toolkit](https://github.com/DrewDawson2027/claude-code-toolkit) enforces these limits mechanically via a PreToolUse hook. Together, the two projects give you structured workflows with automatic cost control.
+| Level | Tool | Est. Cost | When to Use |
+|-------|------|-----------|-------------|
+| 1 | Grep / Read | ~1–5k | Know exactly what you're looking for |
+| 2 | Single agent (Sonnet) | ~40–60k | Need architecture understanding |
+| 3 | Plan agent | ~30–50k | Architecture decisions |
+| 4 | 2 agents parallel | ~80–120k | Truly separate areas (rare) |
 
-## License
+The companion **[claude-code-toolkit](https://github.com/DrewDawson2027/claude-code-toolkit)** enforces these limits mechanically via a `PreToolUse` hook — automatic cost control, no willpower required.
 
-MIT
+---
+
+## 🤝 Contributing
+
+Contributions welcome! If you've built a useful mode or reference card, open a PR. New modes should follow the template in [`examples/custom-mode.md`](examples/custom-mode.md).
+
+---
+
+## 📄 License
+
+MIT — use it, fork it, ship it.
+
+---
+
+<div align="center">
+<p><strong>If this saved you time, a ⭐ star helps others find it.</strong></p>
+</div>
