@@ -1,1 +1,29 @@
+# macOS
 .DS_Store
+.AppleDouble
+.LSOverride
+
+# Temporary files
+*.swp
+*.swo
+*~
+.*.swp
+
+# Editor directories
+.vscode/
+.idea/
+*.sublime-*
+
+# Build artifacts (if any)
+dist/
+build/
+*.pyc
+__pycache__/
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+

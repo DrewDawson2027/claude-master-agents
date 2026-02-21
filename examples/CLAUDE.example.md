@@ -140,6 +140,23 @@ Run in background, Sonnet, max 2 per change. Summarize HIGH-priority only.
 
 When the user asks you to do something, CHECK these triggers BEFORE responding. If a trigger matches, spawn the master agent as a Task tool subagent (subagent_type: general-purpose, model: sonnet).
 
+### Dispatch Priority (Deterministic Tie-Breaking)
+
+When multiple agents could match, use this priority order:
+
+1. **Exact command match** (e.g., `/gsd:*`) → master-workflow
+2. **Explicit skill keyword** (e.g., "review", "research", "design") → matching master agent
+3. **Project context** (`.planning/` exists) → master-workflow
+4. **Implicit action** (e.g., "build", "fix") → master-coder (default for coding tasks)
+5. **Ambiguous request** → Ask user which approach they prefer
+
+**Tie-breaker examples:**
+- "Review the database design" → master-coder (review beats database; explicit > implicit)
+- "Fix the API schema" → master-coder (fix > API; explicit coding action)
+- "Design and implement an API" → Ask user: "Focus on design first (master-architect) or jump to implementation (master-coder)?"
+
+### Agent Triggers
+
 - **master-coder**: "build/create/implement/add/feature" (build), "fix/broken/error/debug/failing/bug" (debug), "review/check/audit/PR" (review), "simplify/refactor/clean" (refactor). After writing significant code → auto-review in background.
 - **master-researcher**: "research/find out/what is/how does X work" (auto-detect domain), "competitor/market/landscape" (market), "paper/study/academic/SSRN" (academic), "docs/documentation/how to use" (technical).
 - **master-architect**: "design/architect/schema/data model" (auto-detect type), "database/table/migration/SQL" (database), "API/endpoint/REST/GraphQL" (api), "system design/infrastructure/scale" (system).
@@ -148,6 +165,31 @@ When the user asks you to do something, CHECK these triggers BEFORE responding. 
 **Still direct (no agent needed):**
 - Simple single-file edits → Direct coding
 - Important decisions → Store in memory
+
+### Dispatch Reporting (MANDATORY)
+
+When spawning a master agent, ALWAYS report using this format:
+
+```
+🎯 Dispatching: master-[agent] ([mode])
+Why: [One-sentence rationale]
+Est. cost: [token range from table above]
+Model: sonnet
+
+[Agent output follows below]
+---
+```
+
+**Example:**
+```
+🎯 Dispatching: master-coder (review)
+Why: Code review requested for authentication implementation
+Est. cost: 25-60k tokens
+Model: sonnet
+
+[Agent performs review...]
+---
+```
 
 ---
 
@@ -158,9 +200,28 @@ Key: `/gsd:progress`, `/gsd:execute-plan`, `/gsd:verify-work`. Never say "done" 
 
 ---
 
-## Learning from Mistakes (AUTONOMOUS)
+## Learning from Mistakes (OPT-IN ONLY)
 
-When user corrects me or I make a mistake:
+**DISABLED BY DEFAULT.** Self-modification is OFF unless explicitly enabled.
+
+### To Enable Learning Mode
+
+Add this section to your `~/.claude/CLAUDE.md`:
+
+```markdown
+## Learning Mode: ENABLED
+
+When I correct you or you make a mistake:
 1. Fix the issue
-2. SILENTLY update: universal → edit this CLAUDE.md, project-specific → `memory/learned-patterns.md`
+2. SILENTLY update: universal → edit CLAUDE.md, project-specific → `memory/learned-patterns.md`
 3. No permission needed. No announcement.
+```
+
+### Default Behavior (Learning DISABLED)
+
+When user corrects you or you make a mistake:
+1. Fix the issue immediately
+2. **STOP.** Do not modify CLAUDE.md or any configuration files
+3. Ask user: "Should I remember this pattern? I can update my configuration if you'd like."
+
+**Why opt-in?** Self-modifying configuration can lead to drift from documented behavior and make debugging harder. Explicit opt-in gives users control over when and how the system learns.
