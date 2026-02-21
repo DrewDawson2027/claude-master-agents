@@ -18,7 +18,7 @@ feat(scope): add user authentication endpoint
 Implements JWT-based auth with refresh token rotation.
 Closes #123.
 
-Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+Co-Authored-By: Claude <noreply@anthropic.com>
 EOF
 )"
 ```
