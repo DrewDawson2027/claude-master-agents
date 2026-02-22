@@ -55,6 +55,13 @@ SQLITE_SHADOW_ENABLED = os.environ.get("CLAUDE_SQLITE_SHADOW", "1") not in {
     "false",
     "False",
 }
+RUNTIME_SAFE_MODE_ENV = os.environ.get("CLAUDE_TEAM_RUNTIME_SAFE_MODE", "0") in {
+    "1",
+    "true",
+    "True",
+}
+LOCK_CONTENTION_WARN_SECONDS = 0.25
+LOCK_METRIC_KEEP = 400
 
 # Phase C: Communication + Task Semantics
 MESSAGE_SLA_THRESHOLDS = {"urgent": 60, "high": 300, "normal": 900, "low": 3600}
@@ -163,6 +170,7 @@ def ensure_dirs() -> None:
                 "sqlite_parity_gate_enabled": True,
                 "sqlite_parity_max_team_failures": 0,
                 "sqlite_parity_max_issue_count": 0,
+                "safe_mode_runtime": False,
             },
         )
 
@@ -188,6 +196,7 @@ def runtime_feature_flags() -> dict[str, Any]:
         "sqlite_parity_gate_enabled": True,
         "sqlite_parity_max_team_failures": 0,
         "sqlite_parity_max_issue_count": 0,
+        "safe_mode_runtime": False,
     }
     cur = read_json(RUNTIME_FEATURE_FLAGS_FILE, defaults) or defaults
     if not isinstance(cur, dict):
@@ -205,6 +214,15 @@ def feature_flag_enabled(name: str, default: bool = False) -> bool:
         return bool(flags.get(name))
     except Exception:
         return default
+
+
+def runtime_safe_mode_enabled() -> bool:
+    if RUNTIME_SAFE_MODE_ENV:
+        return True
+    try:
+        return bool(runtime_feature_flags().get("safe_mode_runtime", False))
+    except Exception:
+        return False
 
 
 
@@ -290,17 +308,98 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     tmp.replace(path)
 
 
+def _maybe_team_id_from_path(path: Path) -> str | None:
+    try:
+        p = path.resolve(strict=False)
+        rel = p.relative_to(TEAMS_DIR)
+        parts = rel.parts
+        if parts:
+            return safe_id(parts[0], "team_id")
+    except Exception:
+        return None
+    return None
+
+
+def _record_lock_metric(path: Path, wait_seconds: float, hold_seconds: float) -> None:
+    team_id = _maybe_team_id_from_path(path)
+    if not team_id:
+        return
+    try:
+        store = TeamStore(team_id)
+        if not store.exists():
+            return
+        metric = {
+            "ts": utc_now(),
+            "lock": path.name,
+            "path": str(path),
+            "waitSeconds": round(float(wait_seconds), 6),
+            "holdSeconds": round(float(hold_seconds), 6),
+            "warn": bool(wait_seconds >= LOCK_CONTENTION_WARN_SECONDS),
+        }
+        _metrics_append(store, "lockContention", metric, keep=LOCK_METRIC_KEEP)
+        if metric["warn"]:
+            try:
+                store.emit_event(
+                    "LockContentionWarning",
+                    lock=path.name,
+                    waitSeconds=metric["waitSeconds"],
+                    holdSeconds=metric["holdSeconds"],
+                )
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _lock_metrics_summary(store: TeamStore, *, limit: int = 200) -> dict[str, Any]:
+    metrics = store.load_metrics()
+    rows = metrics.get("lockContention") or []
+    if not isinstance(rows, list):
+        rows = []
+    rows = rows[-limit:]
+    waits = []
+    warns = 0
+    by_lock: dict[str, int] = {}
+    for r in rows:
+        try:
+            w = float(r.get("waitSeconds") or 0.0)
+        except Exception:
+            w = 0.0
+        waits.append(w)
+        if r.get("warn"):
+            warns += 1
+        lk = str(r.get("lock") or "unknown")
+        by_lock[lk] = by_lock.get(lk, 0) + 1
+    waits_sorted = sorted(waits)
+    p95 = waits_sorted[int(max(0, min(len(waits_sorted) - 1, round((len(waits_sorted) - 1) * 0.95))))] if waits_sorted else 0.0
+    return {
+        "count": len(rows),
+        "warnCount": warns,
+        "maxWaitSeconds": round(max(waits_sorted) if waits_sorted else 0.0, 6),
+        "p95WaitSeconds": round(p95, 6),
+        "byLock": dict(sorted(by_lock.items(), key=lambda kv: (-kv[1], kv[0]))),
+    }
+
+
 @contextmanager
 def file_lock(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+") as f:
+        acquire_start = time.time()
         if fcntl is not None:
             fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        acquired_at = time.time()
         try:
             yield
         finally:
+            released_at = time.time()
             if fcntl is not None:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            _record_lock_metric(
+                path,
+                wait_seconds=max(0.0, acquired_at - acquire_start),
+                hold_seconds=max(0.0, released_at - acquired_at),
+            )
 
 
 @dataclass
@@ -4942,6 +5041,37 @@ def cmd_team_selftest(args: argparse.Namespace) -> str:
     except Exception as e:
         record("sqlite_parity_gate", False, str(e))
     try:
+        lm = _lock_metrics_summary(store)
+        record(
+            "lock_metrics",
+            True,
+            f"count={lm.get('count')} warn={lm.get('warnCount')} p95={lm.get('p95WaitSeconds')}s max={lm.get('maxWaitSeconds')}s",
+        )
+    except Exception as e:
+        record("lock_metrics", False, str(e))
+    try:
+        th = _tmux_health_for_store(store)
+        record(
+            "tmux_health",
+            bool(th.get("ok")),
+            f"issues={len(th.get('issues') or [])} warnings={len(th.get('warnings') or [])} panes={th.get('panesSeen')}/{th.get('paneMembers')}",
+        )
+    except Exception as e:
+        record("tmux_health", False, str(e))
+    try:
+        hw = json.loads(
+            cmd_admin_hook_watchdog(
+                argparse.Namespace(json=True, write_report=False)
+            )
+        )
+        record(
+            "hook_watchdog",
+            bool(hw.get("ok")),
+            f"checks={hw.get('count')} failures={sum(1 for c in (hw.get('checks') or []) if not c.get('ok'))}",
+        )
+    except Exception as e:
+        record("hook_watchdog", False, str(e))
+    try:
         rt = store.load_runtime()
         tmux = rt.get("tmux_session")
         ok = True
@@ -5644,6 +5774,233 @@ def cmd_admin_repair_state(args: argparse.Namespace) -> str:
         lines.append("### Actions")
         for item in report["actions"][:40]:
             lines.append(f"- {item}")
+    return "\n".join(lines)
+
+
+def cmd_admin_lock_metrics(args: argparse.Namespace) -> str:
+    ensure_dirs()
+    if getattr(args, "all", False):
+        team_ids = [str(r.get("team_id")) for r in list_teams()]
+    else:
+        if not getattr(args, "team_id", None):
+            raise SystemExit("Provide --team-id or --all")
+        team_ids = [safe_id(args.team_id, "team_id")]
+    teams: list[dict[str, Any]] = []
+    for tid in team_ids:
+        store = TeamStore(tid)
+        if not store.exists():
+            teams.append({"team_id": tid, "ok": False, "error": "team_not_found"})
+            continue
+        summary = _lock_metrics_summary(store)
+        teams.append({"team_id": tid, "ok": True, **summary})
+    payload = {
+        "ts": utc_now(),
+        "count": len(teams),
+        "teams": teams,
+        "ok": all(bool(t.get("ok")) for t in teams),
+    }
+    if getattr(args, "json", False):
+        return json.dumps(payload, indent=2)
+    lines = ["## Lock Metrics", f"- Teams: {len(teams)}"]
+    for t in teams:
+        if not t.get("ok"):
+            lines.append(f"- {t['team_id']}: FAIL ({t.get('error')})")
+            continue
+        lines.append(
+            f"- {t['team_id']}: count={t.get('count')} warn={t.get('warnCount')} "
+            f"p95={t.get('p95WaitSeconds')}s max={t.get('maxWaitSeconds')}s"
+        )
+    return "\n".join(lines)
+
+
+def _tmux_health_for_store(store: TeamStore) -> dict[str, Any]:
+    cfg = store.load_config()
+    rt = store.load_runtime()
+    tmux_session = rt.get("tmux_session")
+    issues: list[str] = []
+    warnings: list[str] = []
+    pane_rows = _tmux_list_panes(str(tmux_session)) if tmux_session else []
+    panes = {p["paneId"]: p for p in pane_rows}
+    if not tmux_session:
+        issues.append("missing_tmux_session")
+    elif not _tmux_session_exists(str(tmux_session)):
+        issues.append(f"tmux_session_missing:{tmux_session}")
+    allowed_cmds = {"zsh", "bash", "sh", "node", "python", "python3", "claude", "codex"}
+    now = now_epoch()
+    pane_member_count = 0
+    for m in cfg.get("members", []):
+        if str(m.get("kind")) != "pane":
+            continue
+        pane_member_count += 1
+        mid = str(m.get("memberId") or "unknown")
+        pane_id = m.get("paneId")
+        if not pane_id:
+            if str(m.get("status")) in {"starting", "active", "idle"}:
+                warnings.append(f"{mid}:missing_pane_id")
+            continue
+        pane = panes.get(str(pane_id))
+        if not pane:
+            issues.append(f"{mid}:pane_missing:{pane_id}")
+            continue
+        cmd = str(pane.get("command") or "")
+        if cmd and cmd not in allowed_cmds:
+            warnings.append(f"{mid}:suspicious_command:{cmd}")
+        if str(m.get("status")) == "starting":
+            ts = parse_ts(m.get("spawnRequestedAt") or m.get("updatedAt") or m.get("createdAt"))
+            if ts and (now - int(ts)) > 300:
+                warnings.append(f"{mid}:stalled_starting>{format_age(now-int(ts))}")
+    return {
+        "team_id": store.team_id,
+        "tmux_session": tmux_session,
+        "tmux_session_exists": bool(tmux_session and _tmux_session_exists(str(tmux_session))),
+        "paneMembers": pane_member_count,
+        "panesSeen": len(pane_rows),
+        "issues": issues,
+        "warnings": warnings,
+        "ok": len(issues) == 0,
+    }
+
+
+def cmd_admin_tmux_health(args: argparse.Namespace) -> str:
+    ensure_dirs()
+    if getattr(args, "all", False):
+        team_ids = [str(r.get("team_id")) for r in list_teams()]
+    else:
+        if not getattr(args, "team_id", None):
+            raise SystemExit("Provide --team-id or --all")
+        team_ids = [safe_id(args.team_id, "team_id")]
+    reports: list[dict[str, Any]] = []
+    repaired: list[str] = []
+    for tid in team_ids:
+        store = TeamStore(tid)
+        if not store.exists():
+            reports.append({"team_id": tid, "ok": False, "issues": ["team_not_found"], "warnings": []})
+            continue
+        rep = _tmux_health_for_store(store)
+        if getattr(args, "repair", False) and (rep["issues"] or rep["warnings"]):
+            try:
+                _auto_heal_team_once(tid, ensure_tmux=True)
+                repaired.append(tid)
+            except Exception:
+                pass
+            rep = _tmux_health_for_store(store)
+            rep["repairAttempted"] = True
+        reports.append(rep)
+    payload = {
+        "ts": utc_now(),
+        "count": len(reports),
+        "repaired": repaired,
+        "ok": all(bool(r.get("ok")) for r in reports),
+        "teams": reports,
+    }
+    report_path = None
+    if getattr(args, "write_report", False):
+        rdir = CLAUDE_DIR / "reports"
+        rdir.mkdir(parents=True, exist_ok=True)
+        report_path = rdir / f"team-tmux-health-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+        write_json(report_path, payload)
+        payload["reportPath"] = str(report_path)
+    if getattr(args, "json", False):
+        return json.dumps(payload, indent=2)
+    lines = ["## tmux Health Monitor", f"- Teams: {len(reports)}", f"- Status: {'PASS' if payload['ok'] else 'WARN'}"]
+    if report_path:
+        lines.append(f"- Report: {report_path}")
+    for r in reports:
+        lines.append(
+            f"- {r['team_id']}: ok={r.get('ok')} tmux={r.get('tmux_session') or '—'} "
+            f"exists={r.get('tmux_session_exists')} paneMembers={r.get('paneMembers')} panesSeen={r.get('panesSeen')}"
+        )
+        for item in (r.get("issues") or [])[:10]:
+            lines.append(f"  - issue: {item}")
+        for item in (r.get("warnings") or [])[:10]:
+            lines.append(f"  - warn: {item}")
+    return "\n".join(lines)
+
+
+def cmd_admin_hook_watchdog(args: argparse.Namespace) -> str:
+    hooks_dir = CLAUDE_DIR / "hooks"
+    bash_hooks = [
+        "check-inbox.sh",
+        "terminal-heartbeat.sh",
+        "session-register.sh",
+        "session-end.sh",
+        "session-watchdog.sh",
+    ]
+    py_hooks = [
+        "self-heal.py",
+        "token-guard.py",
+        "read-efficiency-guard.py",
+        "agent-metrics.py",
+    ]
+    checks: list[dict[str, Any]] = []
+
+    def _rec(name: str, ok: bool, detail: str) -> None:
+        checks.append({"name": name, "ok": ok, "detail": detail})
+
+    for name in bash_hooks:
+        p = hooks_dir / name
+        if not p.exists():
+            _rec(name, False, "missing")
+            continue
+        cp = subprocess.run(["bash", "-n", str(p)], capture_output=True, text=True)
+        _rec(name, cp.returncode == 0, (cp.stderr or "syntax ok").strip()[:200])
+    for name in py_hooks:
+        p = hooks_dir / name
+        if not p.exists():
+            _rec(name, False, "missing")
+            continue
+        cp = subprocess.run(
+            ["python3", "-m", "py_compile", str(p)],
+            capture_output=True,
+            text=True,
+        )
+        _rec(name, cp.returncode == 0, (cp.stderr or "py_compile ok").strip()[:200])
+
+    # Lightweight probes for critical shell hooks.
+    sample = json.dumps({"session_id": "deadbeef", "tool_name": "Read", "cwd": str(HOME)})
+    probe_targets = [
+        ("probe:check-inbox.sh", hooks_dir / "check-inbox.sh"),
+        ("probe:session-end.sh", hooks_dir / "session-end.sh"),
+    ]
+    for label, p in probe_targets:
+        if not p.exists():
+            _rec(label, False, "missing")
+            continue
+        try:
+            cp = subprocess.run(
+                ["bash", str(p)],
+                input=sample,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env={**os.environ, "CLAUDE_HOOK_WATCHDOG": "1"},
+            )
+            _rec(
+                label,
+                cp.returncode == 0,
+                (cp.stderr or cp.stdout or "ok").strip()[:200],
+            )
+        except subprocess.TimeoutExpired:
+            _rec(label, False, "timeout")
+        except Exception as e:
+            _rec(label, False, str(e)[:200])
+
+    ok = all(c["ok"] for c in checks)
+    payload = {"ts": utc_now(), "ok": ok, "count": len(checks), "checks": checks}
+    report_path = None
+    if getattr(args, "write_report", False):
+        rdir = CLAUDE_DIR / "reports"
+        rdir.mkdir(parents=True, exist_ok=True)
+        report_path = rdir / f"hook-watchdog-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+        write_json(report_path, payload)
+        payload["reportPath"] = str(report_path)
+    if getattr(args, "json", False):
+        return json.dumps(payload, indent=2)
+    lines = ["## Hook Watchdog", f"- Status: {'PASS' if ok else 'FAIL'}", f"- Checks: {len(checks)}"]
+    if report_path:
+        lines.append(f"- Report: {report_path}")
+    for c in checks:
+        lines.append(f"- [{'OK' if c['ok'] else 'FAIL'}] {c['name']}: {c['detail']}")
     return "\n".join(lines)
 
 
@@ -6994,6 +7351,22 @@ def build_parser() -> argparse.ArgumentParser:
     a_repair.add_argument("--write-report", action="store_true")
     a_repair.add_argument("--force", action="store_true")
 
+    a_locks = adm_sp.add_parser("lock-metrics")
+    a_locks.add_argument("--team-id")
+    a_locks.add_argument("--all", action="store_true")
+    a_locks.add_argument("--json", action="store_true")
+
+    a_tmux = adm_sp.add_parser("tmux-health")
+    a_tmux.add_argument("--team-id")
+    a_tmux.add_argument("--all", action="store_true")
+    a_tmux.add_argument("--repair", action="store_true")
+    a_tmux.add_argument("--json", action="store_true")
+    a_tmux.add_argument("--write-report", action="store_true")
+
+    a_hooks = adm_sp.add_parser("hook-watchdog")
+    a_hooks.add_argument("--json", action="store_true")
+    a_hooks.add_argument("--write-report", action="store_true")
+
     # hook
     hook = sp.add_parser("hook")
     hook_sp = hook.add_subparsers(dest="action", required=True)
@@ -7021,6 +7394,30 @@ def build_parser() -> argparse.ArgumentParser:
 def dispatch(args: argparse.Namespace) -> str:
     d = args.domain
     a = args.action
+    if runtime_safe_mode_enabled():
+        read_only: set[tuple[str, str]] = {
+            ("team", "list"),
+            ("team", "status"),
+            ("team", "doctor"),
+            ("team", "dashboard"),
+            ("message", "thread"),
+            ("message", "receipts"),
+            ("message", "sla-status"),
+            ("message", "announcements"),
+            ("task", "list"),
+            ("task", "template-list"),
+            ("task", "graph"),
+            ("task", "export"),
+            ("event", "check"),
+            ("admin", "sqlite-parity"),
+            ("admin", "lock-metrics"),
+            ("admin", "tmux-health"),
+            ("admin", "hook-watchdog"),
+        }
+        if (d, a) not in read_only or (d == "message" and a == "inbox" and bool(getattr(args, "clear", False))):
+            raise SystemExit(
+                f"Runtime safe mode is enabled; blocked mutating command: {d} {a}"
+            )
     if d == "team" and a == "create":
         return cmd_team_create(args)
     if d == "team" and a == "list":
@@ -7145,6 +7542,12 @@ def dispatch(args: argparse.Namespace) -> str:
         return cmd_admin_replay_events(args)
     if d == "admin" and a == "repair-state":
         return cmd_admin_repair_state(args)
+    if d == "admin" and a == "lock-metrics":
+        return cmd_admin_lock_metrics(args)
+    if d == "admin" and a == "tmux-health":
+        return cmd_admin_tmux_health(args)
+    if d == "admin" and a == "hook-watchdog":
+        return cmd_admin_hook_watchdog(args)
     if d == "hook" and a == "session-start":
         return cmd_hook_session_start(args)
     if d == "hook" and a == "heartbeat":

@@ -172,21 +172,31 @@ cmd_migrate() {
     dry_run=1
   fi
   echo "=== Config Migration ==="
+  if [[ $dry_run -eq 1 ]]; then
+    echo "(dry-run) Would ensure directories:"
+    echo "- $CLAUDE_HOME/governance/team-policies"
+    echo "- $CLAUDE_HOME/distribution/releases"
+    echo "- $CLAUDE_HOME/reports"
+    if [[ ! -f "$CLAUDE_HOME/governance/tier2-approvals.json" ]]; then
+      echo "(dry-run) Would create default tier2-approvals.json"
+    fi
+    if [[ ! -f "$CLAUDE_HOME/governance/marketplace-channels.json" ]]; then
+      echo "(dry-run) Would create default marketplace-channels.json"
+    fi
+  else
+    mkdir -p "$CLAUDE_HOME/governance/team-policies"
+    mkdir -p "$CLAUDE_HOME/distribution/releases"
+    mkdir -p "$CLAUDE_HOME/reports"
 
-  # Ensure new directories exist
-  mkdir -p "$CLAUDE_HOME/governance/team-policies"
-  mkdir -p "$CLAUDE_HOME/distribution/releases"
-  mkdir -p "$CLAUDE_HOME/reports"
+    if [[ ! -f "$CLAUDE_HOME/governance/tier2-approvals.json" ]]; then
+      echo '{"approved": []}' > "$CLAUDE_HOME/governance/tier2-approvals.json"
+      echo "Created default tier2-approvals.json"
+    fi
 
-  # Ensure governance files exist with defaults
-  if [[ ! -f "$CLAUDE_HOME/governance/tier2-approvals.json" ]]; then
-    echo '{"approved": []}' > "$CLAUDE_HOME/governance/tier2-approvals.json"
-    echo "Created default tier2-approvals.json"
-  fi
-
-  if [[ ! -f "$CLAUDE_HOME/governance/marketplace-channels.json" ]]; then
-    echo '{"channels": []}' > "$CLAUDE_HOME/governance/marketplace-channels.json"
-    echo "Created default marketplace-channels.json"
+    if [[ ! -f "$CLAUDE_HOME/governance/marketplace-channels.json" ]]; then
+      echo '{"channels": []}' > "$CLAUDE_HOME/governance/marketplace-channels.json"
+      echo "Created default marketplace-channels.json"
+    fi
   fi
 
   echo ""

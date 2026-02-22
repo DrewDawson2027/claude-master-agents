@@ -87,6 +87,32 @@ PY
   tail -60 /tmp/team-gc-weekly.out 2>/dev/null || true
   echo '```'
   echo
+
+  echo "### tmux Health Monitor"
+  echo
+  if python3 ~/.claude/scripts/team_runtime.py admin tmux-health --all > /tmp/team-tmux-health-weekly.out 2>&1; then
+    echo "- Status: PASS"
+  else
+    echo "- Status: FAIL (continuing)"
+  fi
+  echo
+  echo '```'
+  tail -80 /tmp/team-tmux-health-weekly.out 2>/dev/null || true
+  echo '```'
+  echo
+
+  echo "### Hook Watchdog"
+  echo
+  if python3 ~/.claude/scripts/team_runtime.py admin hook-watchdog > /tmp/team-hook-watchdog-weekly.out 2>&1; then
+    echo "- Status: PASS"
+  else
+    echo "- Status: FAIL (continuing)"
+  fi
+  echo
+  echo '```'
+  tail -80 /tmp/team-hook-watchdog-weekly.out 2>/dev/null || true
+  echo '```'
+  echo
 } >> "$WEEKLY_TEAM_REPORT"
 
 ACTIVE_TEAMS=$(python3 - <<'PY'

@@ -27,6 +27,7 @@ const SAFE_CLI_RE = /^[A-Za-z0-9._:-]+$/;
 const MAX_TOKEN_LENGTH = 80;
 const ASYNC_COORDINATOR_HANDLERS = process.env.CLAUDE_ASYNC_COORDINATOR_HANDLERS === "1";
 const RESULT_ENVELOPE_ENABLED = process.env.CLAUDE_COORDINATOR_RESULT_ENVELOPE === "1";
+const COORDINATOR_SAFE_MODE = process.env.CLAUDE_COORDINATOR_SAFE_MODE === "1";
 const ASYNC_MAX_PARALLEL = Math.max(1, Number.parseInt(process.env.CLAUDE_ASYNC_MAX_PARALLEL || "4", 10) || 4);
 let asyncInFlight = 0;
 const asyncQueue = [];
@@ -40,6 +41,52 @@ function failValidation(message) {
   const error = new Error(message);
   error.name = "ValidationError";
   throw error;
+}
+
+function isSafeModeReadOnlyTool(name, args) {
+  const allow = new Set([
+    "coord_list_sessions",
+    "coord_get_session",
+    "coord_get_result",
+    "coord_get_pipeline",
+    "coord_team_list",
+    "coord_team_status",
+    "coord_team_dashboard",
+    "coord_team_doctor",
+    "coord_team_lock_metrics",
+    "coord_team_tmux_health",
+    "coord_team_hook_watchdog",
+    "coord_team_check_events",
+    "coord_cost_summary",
+    "coord_cost_session",
+    "coord_cost_team",
+    "coord_cost_active_block",
+    "coord_cost_statusline",
+    "coord_cost_budget_status",
+    "coord_cost_overview",
+    "coord_cost_budget",
+    "coord_cost_trends",
+    "coord_cost_spend_leaderboard",
+    "coord_cost_anomaly_check",
+    "coord_cost_anomalies",
+    "coord_cost_burn_projection",
+    "coord_ops_today",
+    "coord_ops_alerts",
+    "coord_ops_trends",
+    "coord_obs_health_report",
+    "coord_obs_timeline",
+    "coord_obs_slo",
+    "coord_obs_parity_history",
+    "coord_obs_audit_trail",
+    "coord_policy_lint",
+    "coord_policy_check_action",
+    "coord_policy_check_tools",
+    "coord_policy_verify",
+  ]);
+  if (!allow.has(name)) return false;
+  if (name === "coord_team_tmux_health" && args?.repair) return false;
+  if (name === "coord_team_hook_watchdog" && args?.write_report) return false;
+  return true;
 }
 
 function validateSafeId(value, label) {
@@ -1826,6 +1873,43 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "coord_team_lock_metrics",
+      description: "Show lock contention metrics summary (Phase E reliability).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+          all: { type: "boolean" },
+          json: { type: "boolean" },
+        },
+      },
+    },
+    {
+      name: "coord_team_tmux_health",
+      description: "tmux health monitor: detect missing sessions/panes, stalled starts, suspicious pane commands.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+          all: { type: "boolean" },
+          repair: { type: "boolean" },
+          json: { type: "boolean" },
+          write_report: { type: "boolean" },
+        },
+      },
+    },
+    {
+      name: "coord_team_hook_watchdog",
+      description: "Validate critical hooks (syntax + lightweight probes).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          json: { type: "boolean" },
+          write_report: { type: "boolean" },
+        },
+      },
+    },
+    {
       name: "coord_team_checkpoint",
       description: "Create a parity-gated team checkpoint archive (Phase E starter).",
       inputSchema: {
@@ -2421,6 +2505,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       execFileSync("python3", fullArgv, { encoding: "utf8", timeout: timeoutMs })
     );
   };
+
+  if (COORDINATOR_SAFE_MODE && !isSafeModeReadOnlyTool(name, args)) {
+    const msg = `Coordinator safe mode is enabled; blocked mutating tool: ${name}`;
+    if (RESULT_ENVELOPE_ENABLED) {
+      return withEnvelope(name, startedAt, requestId, () => {
+        const e = new Error(msg);
+        e.name = "PolicyDeniedError";
+        throw e;
+      });
+    }
+    return text(msg);
+  }
 
   try {
   switch (name) {
@@ -3529,6 +3625,33 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case "coord_team_selftest": {
       const argv = ["admin", "selftest", "--team-id", validateSafeId(args.team_id, "team_id")];
       if (typeof args?.cost_timeout === "number") argv.push("--cost-timeout", String(Math.max(3, Math.floor(args.cost_timeout))));
+      return teamTool(argv);
+    }
+
+    case "coord_team_lock_metrics": {
+      const argv = ["admin", "lock-metrics"];
+      if (args?.all) argv.push("--all");
+      if (args?.team_id) argv.push("--team-id", validateSafeId(args.team_id, "team_id"));
+      if (!args?.all && !args?.team_id) failValidation("team_id or all is required");
+      if (args?.json) argv.push("--json");
+      return teamTool(argv);
+    }
+
+    case "coord_team_tmux_health": {
+      const argv = ["admin", "tmux-health"];
+      if (args?.all) argv.push("--all");
+      if (args?.team_id) argv.push("--team-id", validateSafeId(args.team_id, "team_id"));
+      if (!args?.all && !args?.team_id) failValidation("team_id or all is required");
+      if (args?.repair) argv.push("--repair");
+      if (args?.json) argv.push("--json");
+      if (args?.write_report) argv.push("--write-report");
+      return teamTool(argv);
+    }
+
+    case "coord_team_hook_watchdog": {
+      const argv = ["admin", "hook-watchdog"];
+      if (args?.json) argv.push("--json");
+      if (args?.write_report) argv.push("--write-report");
       return teamTool(argv);
     }
 

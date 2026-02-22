@@ -10,5 +10,6 @@
   "sqlite_dual_read_audit": true,
   "sqlite_parity_gate_enabled": true,
   "sqlite_parity_max_team_failures": 0,
-  "sqlite_parity_max_issue_count": 0
+  "sqlite_parity_max_issue_count": 0,
+  "safe_mode_runtime": false
 }

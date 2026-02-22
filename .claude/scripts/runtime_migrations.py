@@ -193,6 +193,11 @@ def migrate_team(team_root: Path, dry_run: bool) -> dict:
         "backup": None,
     }
     try:
+        if dry_run and not db_path.exists():
+            report["pending"] = [
+                {"version": m.version, "description": m.description} for m in MIGRATIONS
+            ]
+            return report
         if not dry_run and not db_path.exists():
             db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(db_path)

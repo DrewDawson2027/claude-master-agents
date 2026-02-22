@@ -16,7 +16,12 @@ OUT = REPORTS / f"weekly-ops-digest-{datetime.now().strftime('%Y%m%d-%H%M%S')}.m
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
 def list_teams() -> list[dict]:
@@ -38,14 +43,50 @@ def list_teams() -> list[dict]:
             r = json.loads(rt.read_text())
         except Exception:
             r = {}
-        out.append({
-            "id": d.name,
-            "name": c.get("name") or d.name,
-            "state": r.get("state") or "unknown",
-            "tmux": r.get("tmux_session"),
-            "members": len(c.get("members") or []),
-        })
+        out.append(
+            {
+                "id": d.name,
+                "name": c.get("name") or d.name,
+                "state": r.get("state") or "unknown",
+                "tmux": r.get("tmux_session"),
+                "members": len(c.get("members") or []),
+            }
+        )
     return out
+
+
+def lock_contention_summary() -> dict:
+    rows = []
+    for t in list_teams():
+        metrics = TEAMS / t["id"] / "metrics.json"
+        if not metrics.exists():
+            continue
+        try:
+            data = json.loads(metrics.read_text())
+        except Exception:
+            continue
+        lc = data.get("lockContention") or []
+        if not isinstance(lc, list):
+            continue
+        rows.extend([r for r in lc[-200:] if isinstance(r, dict)])
+    waits = []
+    warns = 0
+    for r in rows:
+        try:
+            w = float(r.get("waitSeconds") or 0)
+        except Exception:
+            w = 0.0
+        waits.append(w)
+        if r.get("warn"):
+            warns += 1
+    waits.sort()
+    p95 = waits[int((len(waits)-1)*0.95)] if waits else 0.0
+    return {
+        "samples": len(rows),
+        "warns": warns,
+        "maxWaitSeconds": round((max(waits) if waits else 0.0), 6),
+        "p95WaitSeconds": round(p95, 6),
+    }
 
 
 def latest_report(prefix: str) -> Path | None:
@@ -87,6 +128,7 @@ def main() -> int:
     teams = list_teams()
     weekly_recover = parse_recover_report(latest_report("team-recover-hard-weekly"))
     all_recover = parse_recover_report(latest_report("team-recover-hard-all"))
+    lock_summary = lock_contention_summary()
     lines = [
         "# Weekly Ops Digest",
         "",
@@ -100,7 +142,9 @@ def main() -> int:
     ]
     if teams:
         for t in teams:
-            lines.append(f"| {t['id']} | {t['name']} | {t['state']} | {t['members']} | {t.get('tmux') or '—'} |")
+            lines.append(
+                f"| {t['id']} | {t['name']} | {t['state']} | {t['members']} | {t.get('tmux') or '—'} |"
+            )
     else:
         lines.append("| — | — | — | 0 | — |")
     lines += [
@@ -109,6 +153,12 @@ def main() -> int:
         "",
         f"- Weekly recover-hard report: {weekly_recover.get('path') or 'none'} (pass={weekly_recover.get('pass')} fail={weekly_recover.get('fail')})",
         f"- On-demand recover-hard-all report: {all_recover.get('path') or 'none'} (pass={all_recover.get('pass')} fail={all_recover.get('fail')})",
+        "",
+        "## Reliability (Phase E)",
+        "",
+        f"- Lock contention samples: {lock_summary['samples']}",
+        f"- Lock warnings: {lock_summary['warns']}",
+        f"- Lock wait p95/max: {lock_summary['p95WaitSeconds']}s / {lock_summary['maxWaitSeconds']}s",
         "",
         "## Cost (Today)",
         "",
