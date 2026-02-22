@@ -5196,19 +5196,23 @@ def _scan_jsonl_file(path: Path) -> dict[str, Any]:
     return {"rows": out_rows, "total": total, "malformed": malformed}
 
 
-def cmd_team_checkpoint(args: argparse.Namespace) -> str:
-    store = TeamStore(args.team_id)
+def _create_team_checkpoint(
+    store: TeamStore,
+    *,
+    label: str | None = None,
+    include_shadow: bool = True,
+    force: bool = False,
+    emit_event: bool = True,
+    metrics_bucket: str = "checkpoints",
+) -> dict[str, Any]:
     if not store.exists():
-        raise SystemExit(f"Team {args.team_id} not found.")
-    gate = _require_sqlite_parity_gate(
-        store, "team checkpoint", force=bool(getattr(args, "force", False))
-    )
+        raise SystemExit(f"Team {store.team_id} not found.")
+    gate = _require_sqlite_parity_gate(store, "team checkpoint", force=force)
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    label = slugify(getattr(args, "label", None) or "checkpoint", "checkpoint")
+    label_slug = slugify(label or "checkpoint", "checkpoint")
     out_dir = CHECKPOINTS_DIR / store.team_id
     out_dir.mkdir(parents=True, exist_ok=True)
-    archive_path = out_dir / f"{ts}-{label}.tar.gz"
-    include_shadow = bool(getattr(args, "include_shadow", True))
+    archive_path = out_dir / f"{ts}-{label_slug}.tar.gz"
     with tarfile.open(archive_path, "w:gz") as tf:
         for p in sorted(store.paths.root.rglob("*")):
             if not p.is_file():
@@ -5221,7 +5225,7 @@ def cmd_team_checkpoint(args: argparse.Namespace) -> str:
     manifest = {
         "team_id": store.team_id,
         "ts": utc_now(),
-        "label": label,
+        "label": label_slug,
         "archive": str(archive_path),
         "sha256": digest,
         "includeShadow": include_shadow,
@@ -5233,29 +5237,31 @@ def cmd_team_checkpoint(args: argparse.Namespace) -> str:
         },
         "parityAuditSummary": gate["audit"],
     }
-    manifest_path = out_dir / f"{ts}-{label}.json"
+    manifest_path = out_dir / f"{ts}-{label_slug}.json"
     write_json(manifest_path, manifest)
     (archive_path.with_suffix(archive_path.suffix + ".sha256")).write_text(
         f"{digest}  {archive_path.name}\n", encoding="utf-8"
     )
-    _metrics_append(
-        store,
-        "checkpoints",
-        {
-            "ts": utc_now(),
-            "label": label,
-            "archive": str(archive_path),
-            "sha256": digest,
-            "parityGateOk": bool(gate["thresholdOk"]),
-        },
-    )
-    store.emit_event(
-        "TeamCheckpointCreated",
-        checkpointFile=str(archive_path),
-        manifestFile=str(manifest_path),
-        sha256=digest,
-        label=label,
-    )
+    if metrics_bucket:
+        _metrics_append(
+            store,
+            metrics_bucket,
+            {
+                "ts": utc_now(),
+                "label": label_slug,
+                "archive": str(archive_path),
+                "sha256": digest,
+                "parityGateOk": bool(gate["thresholdOk"]),
+            },
+        )
+    if emit_event:
+        store.emit_event(
+            "TeamCheckpointCreated",
+            checkpointFile=str(archive_path),
+            manifestFile=str(manifest_path),
+            sha256=digest,
+            label=label_slug,
+        )
     payload = {
         "ok": True,
         "team_id": store.team_id,
@@ -5269,11 +5275,35 @@ def cmd_team_checkpoint(args: argparse.Namespace) -> str:
             "issueCount": gate["issueCount"],
         },
     }
+    return payload
+
+
+def _pre_destructive_backup(
+    store: TeamStore, operation: str, *, force: bool = False
+) -> dict[str, Any]:
+    return _create_team_checkpoint(
+        store,
+        label=f"pre-{operation}",
+        include_shadow=True,
+        force=force,
+        emit_event=True,
+        metrics_bucket="checkpoints",
+    )
+
+
+def cmd_team_checkpoint(args: argparse.Namespace) -> str:
+    store = TeamStore(args.team_id)
+    payload = _create_team_checkpoint(
+        store,
+        label=getattr(args, "label", None),
+        include_shadow=bool(getattr(args, "include_shadow", True)),
+        force=bool(getattr(args, "force", False)),
+    )
     if getattr(args, "json", False):
         return json.dumps(payload, indent=2)
     return (
-        f"Checkpoint created for {store.team_id}: {archive_path} "
-        f"sha256={digest[:12]} parity_gate_ok={gate['thresholdOk']}"
+        f"Checkpoint created for {store.team_id}: {payload['archive']} "
+        f"sha256={payload['sha256'][:12]} parity_gate_ok={payload['parityGate']['thresholdOk']}"
     )
 
 
@@ -5312,7 +5342,58 @@ def cmd_admin_replay_events(args: argparse.Namespace) -> str:
                 task_state[tid] = "completed"
             elif et in {"TaskClaimReleased"}:
                 task_state[tid] = "pending"
+    current_tasks = store.load_tasks().get("tasks", []) or []
+    current_task_states = {
+        str(t.get("taskId")): str(t.get("status") or "unknown")
+        for t in current_tasks
+        if t.get("taskId")
+    }
+    task_state_diffs: list[dict[str, Any]] = []
+    for tid in sorted(set(current_task_states) | set(task_state)):
+        cur = current_task_states.get(tid)
+        derived = task_state.get(tid)
+        if cur != derived:
+            task_state_diffs.append(
+                {"taskId": tid, "current": cur, "derived": derived}
+            )
     msg_stats = _message_stats(store)
+    before_parity = sqlite_shadow_parity_audit(store)
+    applied: dict[str, Any] = {
+        "applied": False,
+        "shadowResynced": False,
+        "runtimeEventSeqUpdated": False,
+        "runtimeEventSeqBefore": int((store.load_runtime() or {}).get("event_seq") or 0),
+        "runtimeEventSeqAfter": int((store.load_runtime() or {}).get("event_seq") or 0),
+        "backup": None,
+        "taskStateDiffCount": len(task_state_diffs),
+    }
+    if bool(getattr(args, "apply", False)):
+        backup = _pre_destructive_backup(store, "replay-events-apply", force=bool(args.force))
+        applied["backup"] = {
+            "archive": backup.get("archive"),
+            "manifest": backup.get("manifest"),
+            "sha256": backup.get("sha256"),
+        }
+        rt = store.load_runtime()
+        applied["runtimeEventSeqBefore"] = int(rt.get("event_seq") or 0)
+        if last_id > int(rt.get("event_seq") or 0):
+            rt["event_seq"] = int(last_id)
+            store.save_runtime(rt)
+            applied["runtimeEventSeqUpdated"] = True
+        applied["runtimeEventSeqAfter"] = int((store.load_runtime() or {}).get("event_seq") or 0)
+        _resync_event_shadow_from_files(store)
+        _resync_message_shadow_from_files(store)
+        _shadow_sync_config(store, store.load_config())
+        _shadow_sync_runtime(store, store.load_runtime())
+        _shadow_sync_metrics(store, store.load_metrics())
+        _shadow_sync_tasks(store, read_json(store.paths.tasks, {"tasks": []}) or {"tasks": []})
+        _shadow_sync_workers(
+            store, read_json(store.paths.worker_map, {"workers": []}) or {"workers": []}
+        )
+        _shadow_sync_claims(store)
+        applied["shadowResynced"] = True
+        applied["applied"] = True
+    after_parity = sqlite_shadow_parity_audit(store)
     summary = {
         "team_id": store.team_id,
         "ts": utc_now(),
@@ -5337,10 +5418,22 @@ def cmd_admin_replay_events(args: argparse.Namespace) -> str:
             "avgAckSeconds": msg_stats.get("avgAckSeconds"),
         },
         "derivedTaskStates": task_state,
+        "taskStateDiffs": task_state_diffs,
+        "beforeParity": {
+            "ok": bool(before_parity.get("ok")),
+            "issueCount": len(before_parity.get("issues", []) or []),
+            "issues": before_parity.get("issues", []),
+        },
+        "afterParity": {
+            "ok": bool(after_parity.get("ok")),
+            "issueCount": len(after_parity.get("issues", []) or []),
+            "issues": after_parity.get("issues", []),
+        },
+        "apply": applied,
         "ok": duplicate_ids == 0 and non_monotonic == 0,
     }
     report_path = None
-    if getattr(args, "write_report", False):
+    if getattr(args, "write_report", False) or bool(getattr(args, "apply", False)):
         report_dir = CLAUDE_DIR / "reports"
         report_dir.mkdir(parents=True, exist_ok=True)
         report_path = report_dir / f"team-replay-events-{store.team_id}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
@@ -5355,6 +5448,8 @@ def cmd_admin_replay_events(args: argparse.Namespace) -> str:
             "eventCount": len(events),
             "duplicateIds": duplicate_ids,
             "nonMonotonicIds": non_monotonic,
+            "applied": bool(applied.get("applied")),
+            "taskStateDiffCount": len(task_state_diffs),
             "reportPath": str(report_path) if report_path else None,
         },
     )
@@ -5363,6 +5458,8 @@ def cmd_admin_replay_events(args: argparse.Namespace) -> str:
         ok=bool(summary["ok"]),
         duplicateIds=duplicate_ids,
         nonMonotonicIds=non_monotonic,
+        applied=bool(applied.get("applied")),
+        taskStateDiffCount=len(task_state_diffs),
         reportFile=str(report_path) if report_path else None,
     )
     if getattr(args, "json", False):
@@ -5372,6 +5469,8 @@ def cmd_admin_replay_events(args: argparse.Namespace) -> str:
         f"- Status: {'PASS' if summary['ok'] else 'WARN'}",
         f"- Events: {len(events)} (dup={duplicate_ids}, non_monotonic={non_monotonic})",
         f"- Messages: {len(messages)} latest={summary['messages']['latestCount']} open={summary['messages']['open']} stale={summary['messages']['staleOpen']}",
+        f"- Task State Diffs: {len(task_state_diffs)}",
+        f"- Apply: {'yes' if applied.get('applied') else 'no'} shadow_resynced={applied.get('shadowResynced')} runtime_event_seq={applied.get('runtimeEventSeqBefore')}→{applied.get('runtimeEventSeqAfter')}",
     ]
     if report_path:
         lines.append(f"- Report: {report_path}")
@@ -5697,6 +5796,7 @@ def cmd_team_replace_member(args: argparse.Namespace) -> str:
     store = TeamStore(args.team_id)
     if not store.exists():
         raise SystemExit(f"Team {args.team_id} not found.")
+    preop_backup = _pre_destructive_backup(store, "replace-member", force=bool(args.force))
     old_id = safe_id(args.old_member_id, "old_member_id")
     new_id = safe_id(args.new_member_id, "new_member_id")
     cfg = store.load_config()
@@ -5815,7 +5915,8 @@ def cmd_team_replace_member(args: argparse.Namespace) -> str:
     return (
         f"Replaced member {old_id} -> {new_id}. "
         f"tasks_transferred={len(transferred_tasks)} workers_transferred={transferred_workers} "
-        f"pane_stopped={pane_stopped} spawned={spawned}"
+        f"pane_stopped={pane_stopped} spawned={spawned} "
+        f"backup={preop_backup.get('archive')}"
     )
 
 
@@ -5890,6 +5991,7 @@ def cmd_team_archive(args: argparse.Namespace) -> str:
     store = TeamStore(args.team_id)
     if not store.exists():
         raise SystemExit(f"Team {args.team_id} not found.")
+    preop_backup = _pre_destructive_backup(store, "archive", force=bool(args.force_stop))
     rt = store.load_runtime()
     if rt.get("state") in {"running", "paused"}:
         if not args.force_stop:
@@ -5910,7 +6012,10 @@ def cmd_team_archive(args: argparse.Namespace) -> str:
         shutil.rmtree(store.paths.root, ignore_errors=True)
         removed = True
     _remove_team_from_index(store.team_id)
-    return f"Archived team {store.team_id} -> {backup_path} sha256={digest[:12]} removed={removed}"
+    return (
+        f"Archived team {store.team_id} -> {backup_path} sha256={digest[:12]} removed={removed} "
+        f"preop_backup={preop_backup.get('archive')}"
+    )
 
 
 def cmd_team_gc(args: argparse.Namespace) -> str:
@@ -5920,6 +6025,7 @@ def cmd_team_gc(args: argparse.Namespace) -> str:
     now = time.time()
     removed: list[str] = []
     findings: list[str] = []
+    backed_up_teams: dict[str, str] = {}
 
     # Prune orphan index entries.
     idx = load_index()
@@ -5953,6 +6059,10 @@ def cmd_team_gc(args: argparse.Namespace) -> str:
             if mid not in members:
                 findings.append(f"orphan_mailbox:{tid}:{mb.name}")
                 if not dry_run:
+                    if tid not in backed_up_teams:
+                        backed_up_teams[tid] = str(
+                            _pre_destructive_backup(store, "gc", force=False).get("archive")
+                        )
                     mb.unlink(missing_ok=True)
                     removed.append(f"mailbox:{tid}:{mb.name}")
         for c in store.paths.cursors_dir.glob("*.txt"):
@@ -5963,6 +6073,10 @@ def cmd_team_gc(args: argparse.Namespace) -> str:
             if age_days > cursor_age_days:
                 findings.append(f"stale_cursor:{tid}:{c.name}:{int(age_days)}d")
                 if not dry_run:
+                    if tid not in backed_up_teams:
+                        backed_up_teams[tid] = str(
+                            _pre_destructive_backup(store, "gc", force=False).get("archive")
+                        )
                     c.unlink(missing_ok=True)
                     removed.append(f"cursor:{tid}:{c.name}")
 
@@ -5990,6 +6104,7 @@ def cmd_team_gc(args: argparse.Namespace) -> str:
 
     return (
         f"GC complete dry_run={dry_run} findings={len(findings)} removed={len(removed)}\n"
+        + (f"- preop_backups={len(backed_up_teams)}\n" if not dry_run else "")
         + (
             "\n".join([f"- {x}" for x in (removed if not dry_run else findings)][:200])
             if (removed or findings)
@@ -6084,6 +6199,7 @@ def cmd_team_teardown(args: argparse.Namespace) -> str:
     store = TeamStore(args.team_id)
     if not store.exists():
         raise SystemExit(f"Team {args.team_id} not found.")
+    preop_backup = _pre_destructive_backup(store, "teardown", force=False)
     summary = {
         "team_id": store.team_id,
         "ts": utc_now(),
@@ -6125,7 +6241,7 @@ def cmd_team_teardown(args: argparse.Namespace) -> str:
     store.emit_event(
         "TeamTeardown", summaryFile=str(out_file), killPanes=bool(args.kill_panes)
     )
-    return f"{stop_msg}\nSummary: {out_file}"
+    return f"{stop_msg}\nSummary: {out_file}\nPre-op backup: {preop_backup.get('archive')}"
 
 
 def _load_worker_map(store: TeamStore) -> dict[str, Any]:
@@ -6866,6 +6982,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     a_replay = adm_sp.add_parser("replay-events")
     a_replay.add_argument("--team-id", required=True)
+    a_replay.add_argument("--apply", action="store_true")
     a_replay.add_argument("--json", action="store_true")
     a_replay.add_argument("--write-report", action="store_true")
     a_replay.add_argument("--force", action="store_true")

@@ -18,7 +18,7 @@ Commands:
   repair      Run self-heal + policy lint + parity audit
   version     Show installed version from manifest
   upgrade     Apply a release bundle (tar.gz path)
-  migrate     Run any needed config migrations
+  migrate     Run runtime/config migrations (supports --dry-run)
   status      Quick health summary (runtime + cost + policy)
 EOF
 }
@@ -167,6 +167,10 @@ cmd_upgrade() {
 }
 
 cmd_migrate() {
+  local dry_run=0
+  if [[ "${1:-}" == "--dry-run" || "${2:-}" == "--dry-run" ]]; then
+    dry_run=1
+  fi
   echo "=== Config Migration ==="
 
   # Ensure new directories exist
@@ -185,7 +189,15 @@ cmd_migrate() {
     echo "Created default marketplace-channels.json"
   fi
 
-  echo "Migration complete."
+  echo ""
+  echo "=== Runtime Schema Migrations ==="
+  if [[ $dry_run -eq 1 ]]; then
+    python3 "$SCRIPTS/runtime_migrations.py" migrate --dry-run
+    echo "Migration dry-run complete."
+  else
+    python3 "$SCRIPTS/runtime_migrations.py" migrate
+    echo "Migration apply complete."
+  fi
 }
 
 cmd_status() {
@@ -220,7 +232,7 @@ case "${1:-}" in
   repair) cmd_repair ;;
   version) cmd_version ;;
   upgrade) cmd_upgrade "$@" ;;
-  migrate) cmd_migrate ;;
+  migrate) shift; cmd_migrate "$@" ;;
   status) cmd_status ;;
   ""|-h|--help|help) usage ;;
   *) echo "Unknown command: $1" >&2; usage; exit 2 ;;

@@ -1847,6 +1847,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         type: "object",
         properties: {
           team_id: { type: "string" },
+          apply: { type: "boolean", description: "Apply replay rebuild (shadow resync + runtime event_seq repair) and emit diff report" },
           json: { type: "boolean" },
           write_report: { type: "boolean" },
           force: { type: "boolean", description: "Bypass parity gate" },
@@ -3542,6 +3543,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "coord_team_replay_events": {
       const argv = ["admin", "replay-events", "--team-id", validateSafeId(args.team_id, "team_id")];
+      if (args?.apply) argv.push("--apply");
       if (args?.json) argv.push("--json");
       if (args?.write_report) argv.push("--write-report");
       if (args?.force) argv.push("--force");
