@@ -1,0 +1,28 @@
+{
+  "defaultProfile": "budget-aware-v1",
+  "profiles": {
+    "budget-aware-v1": {
+      "strategy": "daily_budget_pct",
+      "description": "Auto-pick team size by comparing current daily burn to the active budget cap.",
+      "fallbackPreset": "standard",
+      "noBudgetPreset": "standard",
+      "rules": [
+        {
+          "maxPct": 40,
+          "preset": "heavy",
+          "reason": "Low burn vs cap: allow more parallelism."
+        },
+        {
+          "maxPct": 75,
+          "preset": "standard",
+          "reason": "Moderate burn: normal team size."
+        },
+        {
+          "maxPct": 1000000,
+          "preset": "lite",
+          "reason": "High burn or near cap: reduce teammate count."
+        }
+      ]
+    }
+  }
+}
