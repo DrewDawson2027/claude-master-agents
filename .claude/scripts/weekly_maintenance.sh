@@ -22,6 +22,18 @@ WEEKLY_TEAM_REPORT=~/.claude/reports/team-recover-hard-weekly-$(date +%Y%m%d-%H%
 {
   echo "## Preflight"
   echo
+  echo "### SQLite Shadow Parity Audit"
+  echo
+  if python3 ~/.claude/scripts/team_runtime.py admin sqlite-parity --all --write-report > /tmp/team-sqlite-parity-weekly.out 2>&1; then
+    echo "- Status: PASS"
+  else
+    echo "- Status: FAIL (continuing)"
+  fi
+  echo
+  echo '```'
+  tail -80 /tmp/team-sqlite-parity-weekly.out 2>/dev/null || true
+  echo '```'
+  echo
   echo "### Auto-Heal (One Shot)"
   echo
   if python3 ~/.claude/scripts/team_runtime.py team auto-heal --ensure-tmux > /tmp/team-auto-heal-weekly.out 2>&1; then

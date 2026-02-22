@@ -9,7 +9,8 @@ import {
 import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, appendFileSync, unlinkSync, openSync, closeSync } from "fs";
 import { join, basename } from "path";
 import { homedir, platform } from "os";
-import { execSync, execFileSync, spawn } from "child_process";
+import { execSync, execFileSync, execFile, spawn } from "child_process";
+import { randomUUID } from "crypto";
 
 const TERMINALS_DIR = join(homedir(), ".claude", "terminals");
 const INBOX_DIR = join(TERMINALS_DIR, "inbox");
@@ -24,6 +25,11 @@ const PLATFORM = platform(); // 'darwin', 'win32', 'linux'
 const SAFE_ID_RE = /^[A-Za-z0-9._-]+$/;
 const SAFE_CLI_RE = /^[A-Za-z0-9._:-]+$/;
 const MAX_TOKEN_LENGTH = 80;
+const ASYNC_COORDINATOR_HANDLERS = process.env.CLAUDE_ASYNC_COORDINATOR_HANDLERS === "1";
+const RESULT_ENVELOPE_ENABLED = process.env.CLAUDE_COORDINATOR_RESULT_ENVELOPE === "1";
+const ASYNC_MAX_PARALLEL = Math.max(1, Number.parseInt(process.env.CLAUDE_ASYNC_MAX_PARALLEL || "4", 10) || 4);
+let asyncInFlight = 0;
+const asyncQueue = [];
 
 // Ensure directories exist
 mkdirSync(INBOX_DIR, { recursive: true });
@@ -638,6 +644,148 @@ function text(content) {
   return { content: [{ type: "text", text: content }] };
 }
 
+const LEGACY_COST_DEPRECATIONS = {
+  coord_cost_summary: { canonical_tool: "coord_cost_overview", canonical_command: "claude-token-guard cost overview" },
+  coord_cost_session: { canonical_tool: "coord_cost_overview", canonical_command: "claude-token-guard cost sessions show --session-id <id>" },
+  coord_cost_team: { canonical_tool: "coord_cost_overview", canonical_command: "claude-token-guard cost teams show --team-id <id>" },
+  coord_cost_active_block: { canonical_tool: "coord_cost_budget", canonical_command: "claude-token-guard cost budget active-block" },
+  coord_cost_statusline: { canonical_tool: "coord_cost_overview", canonical_command: "claude-token-guard cost overview --format statusline" },
+  coord_cost_budget_status: { canonical_tool: "coord_cost_budget", canonical_command: "claude-token-guard cost budget status" },
+  coord_cost_team_budget_recommend: { canonical_tool: "coord_cost_overview", canonical_command: "claude-token-guard cost teams recommend-budget" },
+  coord_cost_set_budget: { canonical_tool: "coord_cost_budget", canonical_command: "claude-token-guard cost budget set" },
+  coord_cost_refresh_index: { canonical_tool: "coord_cost_overview", canonical_command: "claude-token-guard cost index refresh" },
+  coord_cost_export: { canonical_tool: "coord_cost_overview", canonical_command: "claude-token-guard cost export" },
+  coord_cost_burn_rate_check: { canonical_tool: "coord_ops_alerts", canonical_command: "claude-token-guard ops alerts check --kind burn-rate" },
+  coord_cost_burn_projection: { canonical_tool: "coord_ops_alerts", canonical_command: "claude-token-guard ops alerts check --kind burn-rate" },
+  coord_cost_anomaly_check: { canonical_tool: "coord_ops_alerts", canonical_command: "claude-token-guard ops alerts check --kind anomaly" },
+  coord_cost_anomalies: { canonical_tool: "coord_ops_alerts", canonical_command: "claude-token-guard ops alerts check --kind anomaly" },
+  coord_cost_spend_leaderboard: { canonical_tool: "coord_cost_overview", canonical_command: "claude-token-guard cost teams leaderboard" },
+  coord_cost_daily_report: { canonical_tool: "coord_ops_today", canonical_command: "claude-token-guard ops today --markdown" },
+  coord_cost_daily_report_generate: { canonical_tool: "coord_ops_today", canonical_command: "claude-token-guard ops today --markdown" },
+  coord_cost_trends: { canonical_tool: "coord_ops_trends", canonical_command: "claude-token-guard ops trends" },
+};
+
+function textWithDeprecationMetadata(toolName, content) {
+  const meta = LEGACY_COST_DEPRECATIONS[toolName];
+  if (!meta) return text(content);
+  const raw = typeof content === "string" ? content : String(content ?? "");
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      parsed.deprecated = true;
+      parsed.canonical_tool = meta.canonical_tool;
+      parsed.canonical_command = meta.canonical_command;
+      return text(JSON.stringify(parsed, null, 2));
+    }
+  } catch {}
+  const footer = `\n\n[DEPRECATED]\ncanonical_tool=${meta.canonical_tool}\ncanonical_command=${meta.canonical_command}\n`;
+  return text(raw + footer);
+}
+
+function applyLegacyDeprecationToOutput(toolName, data) {
+  if (!(toolName in LEGACY_COST_DEPRECATIONS)) return data;
+  const raw = typeof data === "string" ? data : String(data ?? "");
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      parsed.deprecated = true;
+      parsed.canonical_tool = LEGACY_COST_DEPRECATIONS[toolName].canonical_tool;
+      parsed.canonical_command = LEGACY_COST_DEPRECATIONS[toolName].canonical_command;
+      return JSON.stringify(parsed, null, 2);
+    }
+  } catch {}
+  return `${raw}\n\n[DEPRECATED]\ncanonical_tool=${LEGACY_COST_DEPRECATIONS[toolName].canonical_tool}\ncanonical_command=${LEGACY_COST_DEPRECATIONS[toolName].canonical_command}\n`;
+}
+
+function categorizeExecError(err) {
+  const msg = String(err?.message || err || "");
+  if (err?.name === "ValidationError") return "VALIDATION_ERROR";
+  if (/timed out|ETIMEDOUT/i.test(msg)) return "TIMEOUT";
+  if (/not found|ENOENT/i.test(msg)) return "DEPENDENCY_ERROR";
+  if (/unsafe|invalid|required/i.test(msg)) return "VALIDATION_ERROR";
+  if (/policy/i.test(msg)) return "POLICY_DENIED";
+  return "RUNTIME_ERROR";
+}
+
+function withEnvelope(tool, startedAt, requestId, producer) {
+  try {
+    const data = applyLegacyDeprecationToOutput(tool, producer());
+    if (!RESULT_ENVELOPE_ENABLED) return text(data);
+    return text(JSON.stringify({
+      ok: true,
+      data: { text: data },
+      error: null,
+      meta: { tool, durationMs: Date.now() - startedAt, requestId, warnings: [] },
+    }, null, 2));
+  } catch (err) {
+    const message = err?.message || String(err);
+    if (!RESULT_ENVELOPE_ENABLED) throw err;
+    return text(JSON.stringify({
+      ok: false,
+      data: null,
+      error: { code: categorizeExecError(err), message },
+      meta: { tool, durationMs: Date.now() - startedAt, requestId, warnings: [] },
+    }, null, 2));
+  }
+}
+
+function withEnvelopeAsync(tool, startedAt, requestId, producer) {
+  return Promise.resolve()
+    .then(producer)
+    .then((data) => {
+      data = applyLegacyDeprecationToOutput(tool, data);
+      if (!RESULT_ENVELOPE_ENABLED) return text(data);
+      return text(JSON.stringify({
+        ok: true,
+        data: { text: data },
+        error: null,
+        meta: { tool, durationMs: Date.now() - startedAt, requestId, warnings: [] },
+      }, null, 2));
+    })
+    .catch((err) => {
+      const message = err?.message || String(err);
+      if (!RESULT_ENVELOPE_ENABLED) throw err;
+      return text(JSON.stringify({
+        ok: false,
+        data: null,
+        error: { code: categorizeExecError(err), message },
+        meta: { tool, durationMs: Date.now() - startedAt, requestId, warnings: [] },
+      }, null, 2));
+    });
+}
+
+function runQueuedAsync(task) {
+  return new Promise((resolve, reject) => {
+    const launch = () => {
+      asyncInFlight += 1;
+      Promise.resolve()
+        .then(task)
+        .then(resolve, reject)
+        .finally(() => {
+          asyncInFlight -= 1;
+          const next = asyncQueue.shift();
+          if (next) next();
+        });
+    };
+    if (asyncInFlight < ASYNC_MAX_PARALLEL) launch();
+    else asyncQueue.push(launch);
+  });
+}
+
+function runExecFileAsync(bin, argv, { timeoutMs = 60000, label = "command" } = {}) {
+  return runQueuedAsync(() => new Promise((resolve, reject) => {
+    execFile(bin, argv, { encoding: "utf8", timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) {
+        const detail = String((stderr || stdout || err.message || `${label} failed`)).trim();
+        const e = new Error(detail || `${label} failed`);
+        e.name = err.killed ? "TimeoutError" : (err.name || "ExecError");
+        return reject(e);
+      }
+      resolve((stdout || "").trim() || "(no output)");
+    });
+  }));
+}
+
 function runTeamRuntime(argv) {
   if (!existsSync(TEAM_RUNTIME_SCRIPT)) {
     throw new Error(`Team runtime script not found: ${TEAM_RUNTIME_SCRIPT}`);
@@ -670,6 +818,26 @@ function runCostRuntime(argv) {
     const stdout = err?.stdout ? String(err.stdout).trim() : "";
     throw new Error(stderr || stdout || err?.message || "cost runtime command failed");
   }
+}
+
+async function runTeamRuntimeAsync(argv) {
+  if (!existsSync(TEAM_RUNTIME_SCRIPT)) {
+    throw new Error(`Team runtime script not found: ${TEAM_RUNTIME_SCRIPT}`);
+  }
+  return runExecFileAsync("python3", [TEAM_RUNTIME_SCRIPT, ...argv], {
+    timeoutMs: 120000,
+    label: "team runtime command",
+  });
+}
+
+async function runCostRuntimeAsync(argv) {
+  if (!existsSync(COST_RUNTIME_SCRIPT)) {
+    throw new Error(`Cost runtime script not found: ${COST_RUNTIME_SCRIPT}`);
+  }
+  return runExecFileAsync("python3", [COST_RUNTIME_SCRIPT, ...argv], {
+    timeoutMs: 120000,
+    label: "cost runtime command",
+  });
 }
 
 // ─────────────────────────────────────────────────────────
@@ -1443,6 +1611,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "coord_team_message_sla_status",
+      description: "Inspect message SLA warning/critical state using priority-specific thresholds.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+          emit_events: { type: "boolean", description: "Emit PeerMessageSLAWarning/PeerMessageEscalated events while reporting" },
+        },
+        required: ["team_id"],
+      },
+    },
+    {
       name: "coord_team_task_template_list",
       description: "List available task templates (built-in and team-custom).",
       inputSchema: {
@@ -1540,8 +1720,27 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {
           team_id: { type: "string" },
           file: { type: "string", description: "Output file path" },
+          format: { type: "string", enum: ["json", "csv", "md"] },
         },
         required: ["team_id", "file"],
+      },
+    },
+    {
+      name: "coord_team_task_complete_with_outcome",
+      description: "Alias of coord_team_task_complete for explicit outcome-schema naming.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+          task_id: { type: "string" },
+          member_id: { type: "string" },
+          summary: { type: "string" },
+          artifacts: { type: "array", items: { type: "string" } },
+          next_steps: { type: "array", items: { type: "string" } },
+          risks: { type: "array", items: { type: "string" } },
+          tests_run: { type: "array", items: { type: "string" } },
+        },
+        required: ["team_id", "task_id"],
       },
     },
     {
@@ -1787,8 +1986,45 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "coord_team_auto_scale_policy_status",
+      description: "Show budget policy + recommendation + burn projection + anomaly status for a team.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+          json: { type: "boolean" },
+        },
+        required: ["team_id"],
+      },
+    },
+    {
+      name: "coord_team_auto_scale_apply",
+      description: "Apply budget-policy-driven auto-scaling (downshift) to a running team.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+          dry_run: { type: "boolean" },
+          force: { type: "boolean" },
+        },
+        required: ["team_id"],
+      },
+    },
+    {
       name: "coord_cost_burn_rate_check",
       description: "Check burn-rate projection and alert if budget will be exceeded.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+          project: { type: "string" },
+          json: { type: "boolean" },
+        },
+      },
+    },
+    {
+      name: "coord_cost_burn_projection",
+      description: "Alias of coord_cost_burn_rate_check (projection + exhaustion alert).",
       inputSchema: {
         type: "object",
         properties: {
@@ -1806,6 +2042,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {
           team_id: { type: "string" },
           sensitivity: { type: "number", description: "Multiplier threshold for anomaly detection (default: 2.0)" },
+          json: { type: "boolean" },
+        },
+      },
+    },
+    {
+      name: "coord_cost_anomalies",
+      description: "Alias of coord_cost_anomaly_check (cost/token/message spike detection).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+          sensitivity: { type: "number" },
           json: { type: "boolean" },
         },
       },
@@ -1837,6 +2085,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "coord_cost_daily_report_generate",
+      description: "Alias of coord_cost_daily_report for automation/report pipelines.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          window: { type: "string", enum: ["today", "week", "month"] },
+          team_id: { type: "string" },
+          auto: { type: "boolean" },
+          json: { type: "boolean" },
+        },
+      },
+    },
+    {
       name: "coord_cost_trends",
       description: "Cost trend analysis: daily series, moving averages, week-over-week change.",
       inputSchema: {
@@ -1845,6 +2106,82 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           period: { type: "string", enum: ["week", "month"] },
           format: { type: "string", enum: ["json", "md"] },
           json: { type: "boolean" },
+        },
+      },
+    },
+    {
+      name: "coord_ops_today",
+      description: "Unified token-management single-pane snapshot (hooks + cost + alerts + health).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          json: { type: "boolean" },
+          markdown: { type: "boolean" },
+          refresh: { type: "boolean" },
+          evaluate_alerts: { type: "boolean" },
+        },
+      },
+    },
+    {
+      name: "coord_ops_session_recap",
+      description: "Session recap: agents spawned, blocks, tokens, cost, budget status.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          session_id: { type: "string" },
+          latest: { type: "boolean" },
+          json: { type: "boolean" },
+        },
+      },
+    },
+    {
+      name: "coord_ops_alerts",
+      description: "Alert status or alert evaluation with dedup/proactive checks.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["status", "evaluate"] },
+          json: { type: "boolean" },
+          no_deliver: { type: "boolean" },
+        },
+      },
+    },
+    {
+      name: "coord_ops_trends",
+      description: "Rolling trend analysis (7/14/30 day daily series and deltas).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          window: { type: "number", enum: [7, 14, 30] },
+          json: { type: "boolean" },
+        },
+      },
+    },
+    {
+      name: "coord_cost_overview",
+      description: "Canonical cost overview command (summary/statusline alias wrapper).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          format: { type: "string", enum: ["summary", "statusline"] },
+          window: { type: "string", enum: ["today", "week", "month", "active_block", "custom"] },
+          json: { type: "boolean" },
+          team_id: { type: "string" },
+          session_id: { type: "string" },
+          project: { type: "string" },
+        },
+      },
+    },
+    {
+      name: "coord_cost_budget",
+      description: "Canonical cost budget status wrapper.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          period: { type: "string", enum: ["daily", "weekly", "monthly"] },
+          json: { type: "boolean" },
+          team_id: { type: "string" },
+          project: { type: "string" },
         },
       },
     },
@@ -2002,6 +2339,32 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
+  const requestId = randomUUID();
+  const startedAt = Date.now();
+  const teamTool = (argv) => {
+    if (ASYNC_COORDINATOR_HANDLERS) {
+      return withEnvelopeAsync(name, startedAt, requestId, () => runTeamRuntimeAsync(argv));
+    }
+    return withEnvelope(name, startedAt, requestId, () => runTeamRuntime(argv));
+  };
+  const costTool = (argv) => {
+    if (ASYNC_COORDINATOR_HANDLERS) {
+      return withEnvelopeAsync(name, startedAt, requestId, () => runCostRuntimeAsync(argv));
+    }
+    return withEnvelope(name, startedAt, requestId, () => runCostRuntime(argv));
+  };
+  const costToolDeprecated = (toolName, argv) => {
+    if (ASYNC_COORDINATOR_HANDLERS) {
+      return withEnvelopeAsync(name, startedAt, requestId, async () => {
+        const out = await runCostRuntimeAsync(argv);
+        return applyLegacyDeprecationToOutput(toolName, out);
+      });
+    }
+    return withEnvelope(name, startedAt, requestId, () => {
+      const out = runCostRuntime(argv);
+      return applyLegacyDeprecationToOutput(toolName, out);
+    });
+  };
 
   try {
   switch (name) {
@@ -2646,7 +3009,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     // ─── TEAM RUNTIME WRAPPERS ───
     case "coord_team_list": {
-      return text(runTeamRuntime(["team", "list"]));
+      return teamTool(["team", "list"]);
     }
 
     case "coord_team_create": {
@@ -2657,25 +3020,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (args?.lead_member_id) argv.push("--lead-member-id", validateSafeId(args.lead_member_id, "lead_member_id"));
       if (args?.lead_name) argv.push("--lead-name", String(args.lead_name));
       if (args?.cwd) argv.push("--cwd", String(args.cwd));
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     case "coord_team_start": {
       const argv = ["team", "start", "--team-id", validateSafeId(args.team_id, "team_id")];
       if (args?.cwd) argv.push("--cwd", String(args.cwd));
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     case "coord_team_stop": {
       const argv = ["team", "stop", "--team-id", validateSafeId(args.team_id, "team_id")];
       if (args?.kill_panes) argv.push("--kill-panes");
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     case "coord_team_status": {
       const argv = ["team", "status", "--team-id", validateSafeId(args.team_id, "team_id")];
       if (args?.include_tasks) argv.push("--include-tasks");
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     case "coord_team_add_member": {
@@ -2686,7 +3049,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (args?.kind) argv.push("--kind", String(args.kind));
       if (args?.session_id) argv.push("--session-id", validateSafeId(args.session_id, "session_id"));
       if (args?.cwd) argv.push("--cwd", String(args.cwd));
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     case "coord_team_attach_session": {
@@ -2697,7 +3060,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         "--session-id", validateSafeId(args.session_id, "session_id"),
       ];
       if (args?.cwd) argv.push("--cwd", String(args.cwd));
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     case "coord_team_spawn_teammate": {
@@ -2712,15 +3075,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (args?.agent) argv.push("--agent", validateSafeCliToken(args.agent, "agent"));
       if (args?.model) argv.push("--model", validateSafeCliToken(args.model, "model"));
       if (args?.initial_prompt) argv.push("--initial-prompt", String(args.initial_prompt));
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     case "coord_team_focus": {
-      return text(runTeamRuntime([
+      return teamTool([
         "teammate", "focus",
         "--team-id", validateSafeId(args.team_id, "team_id"),
         "--member-id", validateSafeId(args.member_id, "member_id"),
-      ]));
+      ]);
     }
 
     case "coord_team_interrupt": {
@@ -2730,7 +3093,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         "--member-id", validateSafeId(args.member_id, "member_id"),
       ];
       if (args?.message) argv.push("--message", String(args.message));
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     case "coord_team_send_peer": {
@@ -2742,7 +3105,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         "--content", String(args.content ?? ""),
       ];
       if (args?.priority) argv.push("--priority", String(args.priority));
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     case "coord_team_add_task": {
@@ -2761,13 +3124,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (Array.isArray(args?.files)) {
         for (const file of args.files) argv.push("--file", String(file));
       }
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     case "coord_team_list_tasks": {
       const argv = ["task", "list", "--team-id", validateSafeId(args.team_id, "team_id")];
       if (args?.status) argv.push("--status", String(args.status));
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     case "coord_team_claim_task": {
@@ -2778,7 +3141,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         "--member-id", validateSafeId(args.member_id, "member_id"),
       ];
       if (args?.force) argv.push("--force");
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     case "coord_team_update_task": {
@@ -2790,7 +3153,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       ];
       if (args?.member_id) argv.push("--member-id", validateSafeId(args.member_id, "member_id"));
       if (args?.note) argv.push("--note", String(args.note));
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     case "coord_team_check_events": {
@@ -2798,7 +3161,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (args?.types) argv.push("--types", String(args.types));
       if (args?.since_id != null) argv.push("--since-id", String(Math.trunc(Number(args.since_id))));
       if (args?.consumer) argv.push("--consumer", validateSafeId(args.consumer, "consumer"));
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     case "coord_team_recover_hard": {
@@ -2809,7 +3172,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       else argv.push("--include-workers");
       if (args?.snapshot_window) argv.push("--snapshot-window", String(args.snapshot_window));
       if (typeof args?.cost_timeout === "number") argv.push("--cost-timeout", String(Math.max(3, Math.floor(args.cost_timeout))));
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     case "coord_team_recover_hard_all": {
@@ -2820,7 +3183,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       else argv.push("--include-workers");
       if (args?.snapshot_window) argv.push("--snapshot-window", String(args.snapshot_window));
       if (typeof args?.cost_timeout === "number") argv.push("--cost-timeout", String(Math.max(3, Math.floor(args.cost_timeout))));
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     case "coord_team_recover": {
@@ -2829,7 +3192,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (typeof args?.keep_events === "number") argv.push("--keep-events", String(Math.max(1, Math.floor(args.keep_events))));
       if (args?.include_workers === false) argv.push("--no-include-workers");
       else argv.push("--include-workers");
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     case "coord_team_pause": {
@@ -2838,27 +3201,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         for (const mid of args.member_ids) argv.push("--member-id", validateSafeId(mid, "member_id"));
       }
       if (args?.reason) argv.push("--reason", String(args.reason));
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     case "coord_team_resume": {
       const argv = ["team", "resume", "--team-id", validateSafeId(args.team_id, "team_id")];
       if (args?.ensure_tmux) argv.push("--ensure-tmux");
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     case "coord_team_resume_all": {
       const argv = ["team", "resume-all"];
       if (args?.ensure_tmux) argv.push("--ensure-tmux");
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     case "coord_team_doctor": {
-      return text(runTeamRuntime(["team", "doctor", "--team-id", validateSafeId(args.team_id, "team_id")]));
+      return teamTool(["team", "doctor", "--team-id", validateSafeId(args.team_id, "team_id")]);
     }
 
     case "coord_team_dashboard": {
-      return text(runTeamRuntime(["team", "dashboard", "--team-id", validateSafeId(args.team_id, "team_id")]));
+      return teamTool(["team", "dashboard", "--team-id", validateSafeId(args.team_id, "team_id")]);
     }
 
     case "coord_team_restart_member": {
@@ -2871,7 +3234,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (args?.agent) argv.push("--agent", String(args.agent));
       if (args?.model) argv.push("--model", String(args.model));
       if (args?.initial_prompt) argv.push("--initial-prompt", String(args.initial_prompt));
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     case "coord_team_replace_member": {
@@ -2891,7 +3254,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       else argv.push("--stop-old");
       if (args?.spawn_new === false) argv.push("--no-spawn-new");
       else argv.push("--spawn-new");
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     case "coord_team_clone": {
@@ -2902,7 +3265,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (args?.cwd) argv.push("--cwd", String(args.cwd));
       if (args?.without_tasks) argv.push("--without-tasks");
       if (args?.copy_task_status) argv.push("--copy-task-status");
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     case "coord_team_bootstrap": {
@@ -2917,13 +3280,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (Array.isArray(args?.teammates)) {
         for (const spec of args.teammates) argv.push("--teammate", String(spec));
       }
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     case "coord_team_teardown": {
       const argv = ["team", "teardown", "--team-id", validateSafeId(args.team_id, "team_id")];
       if (args?.kill_panes) argv.push("--kill-panes");
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     case "coord_team_archive": {
@@ -2931,7 +3294,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (args?.force_stop) argv.push("--force-stop");
       if (args?.kill_panes) argv.push("--kill-panes");
       if (args?.keep_team_dir) argv.push("--keep-team-dir");
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     case "coord_team_gc": {
@@ -2939,7 +3302,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (args?.dry_run) argv.push("--dry-run");
       if (args?.prune_tmux) argv.push("--prune-tmux");
       if (typeof args?.cursor_age_days === "number") argv.push("--cursor-age-days", String(Math.max(1, Math.floor(args.cursor_age_days))));
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     case "coord_team_scale_to_preset": {
@@ -2952,16 +3315,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (args?.hard_downshift) argv.push("--hard-downshift");
       if (args?.budget_aware) argv.push("--budget-aware");
       if (args?.dry_run) argv.push("--dry-run");
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     case "coord_team_ack_message": {
-      return text(runTeamRuntime([
+      return teamTool([
         "message", "ack",
         "--team-id", validateSafeId(args.team_id, "team_id"),
         "--message-id", validateSafeId(args.message_id, "message_id"),
         "--member-id", validateSafeId(args.member_id, "member_id"),
-      ]));
+      ]);
     }
 
     case "coord_team_broadcast": {
@@ -2979,7 +3342,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (args?.include_lead) argv.push("--include-lead");
       if (args?.announcement) argv.push("--announcement");
       if (args?.reply_to_message_id) argv.push("--reply-to-message-id", validateSafeId(args.reply_to_message_id, "reply_to_message_id"));
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     // ─── Phase C: Communication + Task Semantics ───
@@ -2987,35 +3350,40 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const argv = ["team", "announce", "--team-id", String(args.team_id), "--content", String(args.content)];
       if (args.priority) argv.push("--priority", args.priority);
       if (args.sticky) argv.push("--sticky");
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
     case "coord_team_announcements": {
-      return text(runTeamRuntime(["message", "announcements", "--team-id", String(args.team_id)]));
+      return teamTool(["message", "announcements", "--team-id", String(args.team_id)]);
     }
     case "coord_team_message_thread": {
-      return text(runTeamRuntime(["message", "thread", "--team-id", String(args.team_id), "--thread-id", String(args.thread_id)]));
+      return teamTool(["message", "thread", "--team-id", String(args.team_id), "--thread-id", String(args.thread_id)]);
     }
     case "coord_team_message_receipts": {
-      return text(runTeamRuntime(["message", "receipts", "--team-id", String(args.team_id)]));
+      return teamTool(["message", "receipts", "--team-id", String(args.team_id)]);
+    }
+    case "coord_team_message_sla_status": {
+      const argv = ["message", "sla-status", "--team-id", String(args.team_id)];
+      if (args.emit_events) argv.push("--emit-events");
+      return teamTool(argv);
     }
     case "coord_team_task_template_list": {
-      return text(runTeamRuntime(["task", "template-list", "--team-id", String(args.team_id)]));
+      return teamTool(["task", "template-list", "--team-id", String(args.team_id)]);
     }
     case "coord_team_task_template_apply": {
       const argv = ["task", "template-apply", "--team-id", String(args.team_id), "--template-name", String(args.template_name)];
       if (args.prefix) argv.push("--prefix", args.prefix);
       if (args.assignees?.length) argv.push("--assignees", ...args.assignees);
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
     case "coord_team_task_graph": {
       const argv = ["task", "graph", "--team-id", String(args.team_id)];
       if (args.format) argv.push("--format", args.format);
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
     case "coord_team_task_rebalance": {
       const argv = ["task", "rebalance", "--team-id", String(args.team_id)];
       if (args.force) argv.push("--force");
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
     case "coord_team_task_complete": {
       const argv = ["task", "complete-with-outcome", "--team-id", String(args.team_id), "--task-id", String(args.task_id)];
@@ -3023,18 +3391,32 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (args.summary) argv.push("--summary", args.summary);
       if (args.artifacts?.length) argv.push("--artifacts", ...args.artifacts);
       if (args.next_steps?.length) argv.push("--next-steps", ...args.next_steps);
-      return text(runTeamRuntime(argv));
+      if (args.risks?.length) argv.push("--risks", args.risks.join(","));
+      if (args.tests_run?.length) argv.push("--tests-run", args.tests_run.join(","));
+      return teamTool(argv);
+    }
+    case "coord_team_task_complete_with_outcome": {
+      const argv = ["task", "complete-with-outcome", "--team-id", String(args.team_id), "--task-id", String(args.task_id)];
+      if (args.member_id) argv.push("--member-id", args.member_id);
+      if (args.summary) argv.push("--summary", args.summary);
+      if (args.artifacts?.length) argv.push("--artifacts", ...args.artifacts);
+      if (args.next_steps?.length) argv.push("--next-steps", ...args.next_steps);
+      if (args.risks?.length) argv.push("--risks", args.risks.join(","));
+      if (args.tests_run?.length) argv.push("--tests-run", args.tests_run.join(","));
+      return teamTool(argv);
     }
     case "coord_team_task_approve": {
       const argv = ["task", "approve", "--team-id", String(args.team_id), "--task-id", String(args.task_id)];
       if (args.approved_by) argv.push("--approved-by", args.approved_by);
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
     case "coord_team_task_import": {
-      return text(runTeamRuntime(["task", "import", "--team-id", String(args.team_id), "--file", String(args.file)]));
+      return teamTool(["task", "import", "--team-id", String(args.team_id), "--file", String(args.file)]);
     }
     case "coord_team_task_export": {
-      return text(runTeamRuntime(["task", "export", "--team-id", String(args.team_id), "--file", String(args.file)]));
+      const argv = ["task", "export", "--team-id", String(args.team_id), "--file", String(args.file)];
+      if (args.format) argv.push("--format", String(args.format));
+      return teamTool(argv);
     }
 
     case "coord_team_release_claim": {
@@ -3045,14 +3427,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       ];
       if (args?.member_id) argv.push("--member-id", validateSafeId(args.member_id, "member_id"));
       if (args?.force) argv.push("--force");
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     case "coord_team_reconcile": {
       const argv = ["team", "reconcile", "--team-id", validateSafeId(args.team_id, "team_id")];
       if (args?.keep_events != null) argv.push("--keep-events", String(Math.trunc(Number(args.keep_events))));
       if (args?.include_workers) argv.push("--include-workers");
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     case "coord_team_auto_heal": {
@@ -3062,7 +3444,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (args?.daemon) argv.push("--daemon");
       if (typeof args?.interval_seconds === "number") argv.push("--interval-seconds", String(Math.max(1, Math.floor(args.interval_seconds))));
       if (typeof args?.iterations === "number") argv.push("--iterations", String(Math.max(1, Math.floor(args.iterations))));
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     case "coord_team_register_worker": {
@@ -3074,7 +3456,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (args?.task_id) argv.push("--task-id", validateSafeId(args.task_id, "task_id"));
       if (args?.member_id) argv.push("--member-id", validateSafeId(args.member_id, "member_id"));
       if (args?.auto_complete) argv.push("--auto-complete");
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     case "coord_team_attach_worker_result": {
@@ -3085,13 +3467,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       ];
       if (args?.task_id) argv.push("--task-id", validateSafeId(args.task_id, "task_id"));
       if (args?.member_id) argv.push("--member-id", validateSafeId(args.member_id, "member_id"));
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     case "coord_team_selftest": {
       const argv = ["admin", "selftest", "--team-id", validateSafeId(args.team_id, "team_id")];
       if (typeof args?.cost_timeout === "number") argv.push("--cost-timeout", String(Math.max(3, Math.floor(args.cost_timeout))));
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
     }
 
     // ─── COST RUNTIME WRAPPERS ───
@@ -3105,7 +3487,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (args?.project) argv.push("--project", String(args.project));
       if (args?.breakdown) argv.push("--breakdown");
       if (args?.json) argv.push("--json");
-      return text(runCostRuntime(argv));
+      return costToolDeprecated("coord_cost_summary", argv);
     }
 
     case "coord_cost_session": {
@@ -3114,7 +3496,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (args?.since) argv.push("--since", String(args.since));
       if (args?.until) argv.push("--until", String(args.until));
       if (args?.json) argv.push("--json");
-      return text(runCostRuntime(argv));
+      return costToolDeprecated("coord_cost_session", argv);
     }
 
     case "coord_cost_team": {
@@ -3124,7 +3506,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (args?.until) argv.push("--until", String(args.until));
       if (args?.include_members) argv.push("--include-members");
       if (args?.json) argv.push("--json");
-      return text(runCostRuntime(argv));
+      return costToolDeprecated("coord_cost_team", argv);
     }
 
     case "coord_cost_active_block": {
@@ -3132,7 +3514,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (args?.team_id) argv.push("--team-id", validateSafeId(args.team_id, "team_id"));
       if (args?.project) argv.push("--project", String(args.project));
       if (args?.json) argv.push("--json");
-      return text(runCostRuntime(argv));
+      return costToolDeprecated("coord_cost_active_block", argv);
     }
 
     case "coord_cost_statusline": {
@@ -3141,7 +3523,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (args?.session_id) argv.push("--session-id", validateSafeId(args.session_id, "session_id"));
       if (args?.project) argv.push("--project", String(args.project));
       if (args?.cost_source) argv.push("--cost-source", String(args.cost_source));
-      return text(runCostRuntime(argv));
+      return costToolDeprecated("coord_cost_statusline", argv);
     }
 
     case "coord_cost_budget_status": {
@@ -3150,7 +3532,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (args?.team_id) argv.push("--team-id", validateSafeId(args.team_id, "team_id"));
       if (args?.project) argv.push("--project", String(args.project));
       if (args?.json) argv.push("--json");
-      return text(runCostRuntime(argv));
+      return costToolDeprecated("coord_cost_budget_status", argv);
     }
 
     case "coord_cost_team_budget_recommend": {
@@ -3158,7 +3540,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (args?.team_id) argv.push("--team-id", validateSafeId(args.team_id, "team_id"));
       if (args?.project) argv.push("--project", String(args.project));
       if (args?.json) argv.push("--json");
-      return text(runCostRuntime(argv));
+      return costToolDeprecated("coord_cost_team_budget_recommend", argv);
     }
 
     case "coord_cost_set_budget": {
@@ -3170,14 +3552,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       ];
       if (args?.team_id) argv.push("--team-id", validateSafeId(args.team_id, "team_id"));
       if (args?.project) argv.push("--project", String(args.project));
-      return text(runCostRuntime(argv));
+      return costToolDeprecated("coord_cost_set_budget", argv);
     }
 
     case "coord_cost_refresh_index": {
       const argv = ["index-refresh"];
       if (args?.force) argv.push("--force");
       if (args?.json) argv.push("--json");
-      return text(runCostRuntime(argv));
+      return costToolDeprecated("coord_cost_refresh_index", argv);
     }
 
     case "coord_cost_export": {
@@ -3188,7 +3570,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (args?.team_id) argv.push("--team-id", validateSafeId(args.team_id, "team_id"));
       if (args?.session_id) argv.push("--session-id", validateSafeId(args.session_id, "session_id"));
       if (args?.project) argv.push("--project", String(args.project));
-      return text(runCostRuntime(argv));
+      return costToolDeprecated("coord_cost_export", argv);
     }
 
     // --- Phase D: Cost Intelligence + Live Budget Control handlers ---
@@ -3201,21 +3583,46 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (args?.warn_pct != null) argv.push("--warn-pct", String(args.warn_pct));
       if (args?.crit_pct != null) argv.push("--crit-pct", String(args.crit_pct));
       if (args?.preset_override) argv.push("--preset-override", String(args.preset_override));
-      return text(runTeamRuntime(argv));
+      return teamTool(argv);
+    }
+    case "coord_team_auto_scale_policy_status": {
+      const argv = ["team", "auto-scale-policy-status", "--team-id", validateSafeId(args.team_id, "team_id")];
+      if (args?.json) argv.push("--json");
+      return teamTool(argv);
+    }
+    case "coord_team_auto_scale_apply": {
+      const argv = ["team", "auto-scale-apply", "--team-id", validateSafeId(args.team_id, "team_id")];
+      if (args?.dry_run) argv.push("--dry-run");
+      if (args?.force) argv.push("--force");
+      return teamTool(argv);
     }
     case "coord_cost_burn_rate_check": {
       const argv = ["burn-rate-check"];
       if (args?.team_id) argv.push("--team-id", validateSafeId(args.team_id, "team_id"));
       if (args?.project) argv.push("--project", String(args.project));
       if (args?.json) argv.push("--json");
-      return text(runCostRuntime(argv));
+      return costToolDeprecated("coord_cost_burn_rate_check", argv);
+    }
+    case "coord_cost_burn_projection": {
+      const argv = ["burn-rate-check"];
+      if (args?.team_id) argv.push("--team-id", validateSafeId(args.team_id, "team_id"));
+      if (args?.project) argv.push("--project", String(args.project));
+      if (args?.json) argv.push("--json");
+      return costToolDeprecated("coord_cost_burn_projection", argv);
     }
     case "coord_cost_anomaly_check": {
       const argv = ["anomaly-check"];
       if (args?.team_id) argv.push("--team-id", validateSafeId(args.team_id, "team_id"));
       if (args?.sensitivity != null) argv.push("--sensitivity", String(args.sensitivity));
       if (args?.json) argv.push("--json");
-      return text(runCostRuntime(argv));
+      return costToolDeprecated("coord_cost_anomaly_check", argv);
+    }
+    case "coord_cost_anomalies": {
+      const argv = ["anomaly-check"];
+      if (args?.team_id) argv.push("--team-id", validateSafeId(args.team_id, "team_id"));
+      if (args?.sensitivity != null) argv.push("--sensitivity", String(args.sensitivity));
+      if (args?.json) argv.push("--json");
+      return costToolDeprecated("coord_cost_anomalies", argv);
     }
     case "coord_cost_spend_leaderboard": {
       const argv = ["spend-leaderboard"];
@@ -3223,7 +3630,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (args?.group_by) argv.push("--group-by", String(args.group_by));
       if (args?.limit != null) argv.push("--limit", String(args.limit));
       if (args?.json) argv.push("--json");
-      return text(runCostRuntime(argv));
+      return costToolDeprecated("coord_cost_spend_leaderboard", argv);
     }
     case "coord_cost_daily_report": {
       const argv = ["daily-report"];
@@ -3231,14 +3638,68 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (args?.team_id) argv.push("--team-id", validateSafeId(args.team_id, "team_id"));
       if (args?.auto) argv.push("--auto");
       if (args?.json) argv.push("--json");
-      return text(runCostRuntime(argv));
+      return costToolDeprecated("coord_cost_daily_report", argv);
+    }
+    case "coord_cost_daily_report_generate": {
+      const argv = ["daily-report"];
+      if (args?.window) argv.push("--window", String(args.window));
+      if (args?.team_id) argv.push("--team-id", validateSafeId(args.team_id, "team_id"));
+      if (args?.auto) argv.push("--auto");
+      if (args?.json) argv.push("--json");
+      return costToolDeprecated("coord_cost_daily_report_generate", argv);
     }
     case "coord_cost_trends": {
       const argv = ["cost-trends"];
       if (args?.period) argv.push("--period", String(args.period));
       if (args?.format) argv.push("--format", String(args.format));
       if (args?.json) argv.push("--json");
-      return text(runCostRuntime(argv));
+      return costToolDeprecated("coord_cost_trends", argv);
+    }
+    case "coord_ops_today": {
+      const argv = [join(homedir(), ".claude", "hooks", "claude_token_guard", "cli.py"), "ops", "today"];
+      if (args?.json) argv.push("--json");
+      if (args?.markdown) argv.push("--markdown");
+      if (args?.refresh) argv.push("--refresh");
+      if (args?.evaluate_alerts) argv.push("--evaluate-alerts");
+      return text(execFileSync("python3", argv, { encoding: "utf8", timeout: 60000 }));
+    }
+    case "coord_ops_session_recap": {
+      const argv = [join(homedir(), ".claude", "hooks", "claude_token_guard", "cli.py"), "ops", "session-recap"];
+      if (args?.session_id) argv.push("--session-id", validateSafeId(args.session_id, "session_id"));
+      if (args?.latest || !args?.session_id) argv.push("--latest");
+      if (args?.json) argv.push("--json");
+      return text(execFileSync("python3", argv, { encoding: "utf8", timeout: 60000 }));
+    }
+    case "coord_ops_alerts": {
+      const action = String(args?.action || "status");
+      const argv = [join(homedir(), ".claude", "hooks", "claude_token_guard", "cli.py"), "ops", "alerts", action];
+      if (args?.json) argv.push("--json");
+      if (args?.no_deliver) argv.push("--no-deliver");
+      return text(execFileSync("python3", argv, { encoding: "utf8", timeout: 60000 }));
+    }
+    case "coord_ops_trends": {
+      const argv = [join(homedir(), ".claude", "hooks", "claude_token_guard", "cli.py"), "ops", "trends"];
+      if (args?.window != null) argv.push("--window", String(args.window));
+      if (args?.json) argv.push("--json");
+      return text(execFileSync("python3", argv, { encoding: "utf8", timeout: 60000 }));
+    }
+    case "coord_cost_overview": {
+      const argv = [join(homedir(), ".claude", "hooks", "claude_token_guard", "cli.py"), "cost", "overview"];
+      if (args?.format) argv.push("--format", String(args.format));
+      if (args?.window) argv.push("--window", String(args.window));
+      if (args?.json) argv.push("--json");
+      if (args?.team_id) argv.push("--team-id", validateSafeId(args.team_id, "team_id"));
+      if (args?.session_id) argv.push("--session-id", validateSafeId(args.session_id, "session_id"));
+      if (args?.project) argv.push("--project", String(args.project));
+      return text(execFileSync("python3", argv, { encoding: "utf8", timeout: 60000 }));
+    }
+    case "coord_cost_budget": {
+      const argv = [join(homedir(), ".claude", "hooks", "claude_token_guard", "cli.py"), "cost", "budget", "status"];
+      if (args?.period) argv.push("--period", String(args.period));
+      if (args?.json) argv.push("--json");
+      if (args?.team_id) argv.push("--team-id", validateSafeId(args.team_id, "team_id"));
+      if (args?.project) argv.push("--project", String(args.project));
+      return text(execFileSync("python3", argv, { encoding: "utf8", timeout: 60000 }));
     }
 
     // --- Phase F: Observability handlers ---
@@ -3382,6 +3843,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   } catch (err) {
     const message = err?.message || String(err);
     const prefix = err?.name === "ValidationError" ? "Validation error" : "Coordinator error";
+    if (RESULT_ENVELOPE_ENABLED) {
+      return text(JSON.stringify({
+        ok: false,
+        data: null,
+        error: { code: categorizeExecError(err), message: `${prefix}: ${message}` },
+        meta: { tool: name, durationMs: Date.now() - startedAt, requestId, warnings: [] },
+      }, null, 2));
+    }
     return text(`${prefix}: ${message}`);
   }
 });

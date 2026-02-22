@@ -1,0 +1,9 @@
+{
+  "defaults": {
+    "autoDownshift": true,
+    "warnPct": 80,
+    "critPct": 95,
+    "modelPolicy": "balanced"
+  },
+  "teams": {}
+}
