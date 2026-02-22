@@ -1826,6 +1826,50 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "coord_team_checkpoint",
+      description: "Create a parity-gated team checkpoint archive (Phase E starter).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+          label: { type: "string" },
+          json: { type: "boolean" },
+          force: { type: "boolean", description: "Bypass parity gate" },
+          include_shadow: { type: "boolean", description: "Include shadow.sqlite3 in archive (default true)" },
+        },
+        required: ["team_id"],
+      },
+    },
+    {
+      name: "coord_team_replay_events",
+      description: "Replay team events/messages into derived summaries and validate monotonicity (parity-gated).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+          json: { type: "boolean" },
+          write_report: { type: "boolean" },
+          force: { type: "boolean", description: "Bypass parity gate" },
+        },
+        required: ["team_id"],
+      },
+    },
+    {
+      name: "coord_team_repair_state",
+      description: "Repair malformed team state files/ledgers with backups (dry-run by default, parity-gated).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+          apply: { type: "boolean", description: "Apply repairs (default dry-run)" },
+          json: { type: "boolean" },
+          write_report: { type: "boolean" },
+          force: { type: "boolean", description: "Bypass parity gate" },
+        },
+        required: ["team_id"],
+      },
+    },
+    {
       name: "coord_cost_summary",
       description: "Cost summary (/cost-equivalent) using ccusage + local log fallback.",
       inputSchema: {
@@ -3484,6 +3528,32 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case "coord_team_selftest": {
       const argv = ["admin", "selftest", "--team-id", validateSafeId(args.team_id, "team_id")];
       if (typeof args?.cost_timeout === "number") argv.push("--cost-timeout", String(Math.max(3, Math.floor(args.cost_timeout))));
+      return teamTool(argv);
+    }
+
+    case "coord_team_checkpoint": {
+      const argv = ["team", "checkpoint", "--team-id", validateSafeId(args.team_id, "team_id")];
+      if (args?.label) argv.push("--label", String(args.label));
+      if (args?.json) argv.push("--json");
+      if (args?.force) argv.push("--force");
+      if (args?.include_shadow === false) argv.push("--no-shadow");
+      return teamTool(argv);
+    }
+
+    case "coord_team_replay_events": {
+      const argv = ["admin", "replay-events", "--team-id", validateSafeId(args.team_id, "team_id")];
+      if (args?.json) argv.push("--json");
+      if (args?.write_report) argv.push("--write-report");
+      if (args?.force) argv.push("--force");
+      return teamTool(argv);
+    }
+
+    case "coord_team_repair_state": {
+      const argv = ["admin", "repair-state", "--team-id", validateSafeId(args.team_id, "team_id")];
+      if (args?.apply) argv.push("--apply");
+      if (args?.json) argv.push("--json");
+      if (args?.write_report) argv.push("--write-report");
+      if (args?.force) argv.push("--force");
       return teamTool(argv);
     }
 

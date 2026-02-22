@@ -136,6 +136,19 @@ else
     {
       echo "### $TEAM_ID"
       echo
+      echo "#### Checkpoint: $TEAM_ID"
+      echo
+      if python3 ~/.claude/scripts/team_runtime.py team checkpoint --team-id "$TEAM_ID" --label weekly-pre-recover > /tmp/team-checkpoint-$TEAM_ID.out 2>&1; then
+        echo "- Checkpoint: PASS"
+      else
+        echo "- Checkpoint: FAIL (continuing)"
+      fi
+      echo
+      echo '```'
+      tail -40 /tmp/team-checkpoint-$TEAM_ID.out 2>/dev/null || true
+      echo '```'
+      echo
+
       if python3 ~/.claude/scripts/team_runtime.py team recover-hard --team-id "$TEAM_ID" --include-workers --snapshot-window today --cost-timeout 20 > /tmp/team-recover-hard-$TEAM_ID.out 2>&1; then
         echo "- Status: PASS"
       else

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -35,6 +36,7 @@ TEAM_INDEX_FILE = TEAMS_DIR / "index.json"
 INBOX_DIR = TERMINALS_DIR / "inbox"
 RESULTS_DIR = TERMINALS_DIR / "results"
 ARCHIVES_DIR = CLAUDE_DIR / "archives" / "teams"
+CHECKPOINTS_DIR = CLAUDE_DIR / "checkpoints" / "teams"
 TEAM_PRESET_PROFILE_FILE = CLAUDE_DIR / "cost" / "team-preset-profiles.json"
 COST_CACHE_FILE = CLAUDE_DIR / "cost" / "cache.json"
 COST_BUDGETS_FILE = CLAUDE_DIR / "cost" / "budgets.json"
@@ -142,6 +144,7 @@ def ensure_dirs() -> None:
     INBOX_DIR.mkdir(parents=True, exist_ok=True)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     ARCHIVES_DIR.mkdir(parents=True, exist_ok=True)
+    CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
     ff_dir = RUNTIME_FEATURE_FLAGS_FILE.parent
     ff_dir.mkdir(parents=True, exist_ok=True)
     if not RUNTIME_FEATURE_FLAGS_FILE.exists():
@@ -153,6 +156,9 @@ def ensure_dirs() -> None:
                 "sqlite_tasks": False,
                 "sqlite_claims": False,
                 "sqlite_workers": False,
+                "sqlite_config": False,
+                "sqlite_runtime": False,
+                "sqlite_metrics": False,
                 "sqlite_dual_read_audit": True,
                 "sqlite_parity_gate_enabled": True,
                 "sqlite_parity_max_team_failures": 0,
@@ -169,30 +175,26 @@ def canonical_path(path: str) -> str:
 
 
 def runtime_feature_flags() -> dict[str, Any]:
-    return read_json(
-        RUNTIME_FEATURE_FLAGS_FILE,
-        {
-            "sqlite_messages": False,
-            "sqlite_events": False,
-            "sqlite_tasks": False,
-            "sqlite_claims": False,
-            "sqlite_workers": False,
-            "sqlite_dual_read_audit": True,
-            "sqlite_parity_gate_enabled": True,
-            "sqlite_parity_max_team_failures": 0,
-            "sqlite_parity_max_issue_count": 0,
-        },
-    ) or {
+    defaults = {
         "sqlite_messages": False,
         "sqlite_events": False,
         "sqlite_tasks": False,
         "sqlite_claims": False,
         "sqlite_workers": False,
+        "sqlite_config": False,
+        "sqlite_runtime": False,
+        "sqlite_metrics": False,
         "sqlite_dual_read_audit": True,
         "sqlite_parity_gate_enabled": True,
         "sqlite_parity_max_team_failures": 0,
         "sqlite_parity_max_issue_count": 0,
     }
+    cur = read_json(RUNTIME_FEATURE_FLAGS_FILE, defaults) or defaults
+    if not isinstance(cur, dict):
+        return dict(defaults)
+    merged = dict(defaults)
+    merged.update(cur)
+    return merged
 
 
 def feature_flag_enabled(name: str, default: bool = False) -> bool:
@@ -350,6 +352,10 @@ class TeamPaths:
         return self.root / "workers.json"
 
     @property
+    def metrics(self) -> Path:
+        return self.root / "metrics.json"
+
+    @property
     def shadow_db(self) -> Path:
         return self.root / "shadow.sqlite3"
 
@@ -383,8 +389,30 @@ class TeamStore:
             write_json(self.paths.tasks, {"tasks": []})
         if not self.paths.worker_map.exists():
             write_json(self.paths.worker_map, {"workers": []})
+        if not self.paths.metrics.exists():
+            write_json(
+                self.paths.metrics,
+                {"snapshots": [], "checkpoints": [], "repairs": [], "replays": []},
+            )
         # Initialize shadow snapshots so parity audits are meaningful immediately.
         try:
+            _shadow_sync_config(self, read_json(self.paths.config, {}) or {})
+            _shadow_sync_runtime(
+                self,
+                read_json(
+                    self.paths.runtime,
+                    {"state": "stopped", "event_seq": 0, "tmux_session": None},
+                )
+                or {"state": "stopped", "event_seq": 0, "tmux_session": None},
+            )
+            _shadow_sync_metrics(
+                self,
+                read_json(
+                    self.paths.metrics,
+                    {"snapshots": [], "checkpoints": [], "repairs": [], "replays": []},
+                )
+                or {"snapshots": [], "checkpoints": [], "repairs": [], "replays": []},
+            )
             _shadow_sync_tasks(self, read_json(self.paths.tasks, {"tasks": []}) or {"tasks": []})
             _shadow_sync_workers(
                 self, read_json(self.paths.worker_map, {"workers": []}) or {"workers": []}
@@ -394,7 +422,11 @@ class TeamStore:
             pass
 
     def load_config(self) -> dict[str, Any]:
-        cfg = read_json(self.paths.config, {}) or {}
+        cfg = None
+        if feature_flag_enabled("sqlite_config", False):
+            cfg = _load_config_doc_sqlite(self)
+        if cfg is None:
+            cfg = read_json(self.paths.config, {}) or {}
         if "members" not in cfg or not isinstance(cfg.get("members"), list):
             cfg["members"] = []
         return cfg
@@ -402,16 +434,23 @@ class TeamStore:
     def save_config(self, cfg: dict[str, Any]) -> None:
         cfg["updatedAt"] = utc_now()
         write_json(self.paths.config, cfg)
+        _shadow_sync_config(self, cfg)
 
     def load_runtime(self) -> dict[str, Any]:
-        return read_json(
-            self.paths.runtime,
-            {"state": "stopped", "event_seq": 0, "tmux_session": None},
-        ) or {"state": "stopped", "event_seq": 0, "tmux_session": None}
+        doc = None
+        if feature_flag_enabled("sqlite_runtime", False):
+            doc = _load_runtime_doc_sqlite(self)
+        if doc is None:
+            doc = read_json(
+                self.paths.runtime,
+                {"state": "stopped", "event_seq": 0, "tmux_session": None},
+            ) or {"state": "stopped", "event_seq": 0, "tmux_session": None}
+        return doc
 
     def save_runtime(self, runtime: dict[str, Any]) -> None:
         runtime["updatedAt"] = utc_now()
         write_json(self.paths.runtime, runtime)
+        _shadow_sync_runtime(self, runtime)
 
     def load_tasks(self) -> dict[str, Any]:
         doc = None
@@ -445,6 +484,28 @@ class TeamStore:
         wm["updatedAt"] = utc_now()
         write_json(self.paths.worker_map, wm)
         _shadow_sync_workers(self, wm)
+
+    def load_metrics(self) -> dict[str, Any]:
+        doc = None
+        if feature_flag_enabled("sqlite_metrics", False):
+            doc = _load_metrics_doc_sqlite(self)
+        if doc is None:
+            doc = read_json(
+                self.paths.metrics,
+                {"snapshots": [], "checkpoints": [], "repairs": [], "replays": []},
+            ) or {"snapshots": [], "checkpoints": [], "repairs": [], "replays": []}
+        for k in ("snapshots", "checkpoints", "repairs", "replays"):
+            if not isinstance(doc.get(k), list):
+                doc[k] = []
+        return doc
+
+    def save_metrics(self, metrics: dict[str, Any]) -> None:
+        for k in ("snapshots", "checkpoints", "repairs", "replays"):
+            if not isinstance(metrics.get(k), list):
+                metrics[k] = []
+        metrics["updatedAt"] = utc_now()
+        write_json(self.paths.metrics, metrics)
+        _shadow_sync_metrics(self, metrics)
 
     def next_event_id(self) -> int:
         with file_lock(self.paths.root / ".runtime.lock"):
@@ -643,6 +704,26 @@ def load_event_ledger(store: TeamStore) -> list[dict[str, Any]]:
 def sqlite_shadow_parity_audit(store: TeamStore) -> dict[str, Any]:
     # Seed missing shadows for legacy teams before comparing.
     try:
+        if _load_config_doc_sqlite(store) is None:
+            _shadow_sync_config(store, read_json(store.paths.config, {}) or {})
+        if _load_runtime_doc_sqlite(store) is None:
+            _shadow_sync_runtime(
+                store,
+                read_json(
+                    store.paths.runtime,
+                    {"state": "stopped", "event_seq": 0, "tmux_session": None},
+                )
+                or {"state": "stopped", "event_seq": 0, "tmux_session": None},
+            )
+        if _load_metrics_doc_sqlite(store) is None:
+            _shadow_sync_metrics(
+                store,
+                read_json(
+                    store.paths.metrics,
+                    {"snapshots": [], "checkpoints": [], "repairs": [], "replays": []},
+                )
+                or {"snapshots": [], "checkpoints": [], "repairs": [], "replays": []},
+            )
         if _load_tasks_doc_sqlite(store) is None:
             _shadow_sync_tasks(store, read_json(store.paths.tasks, {"tasks": []}) or {"tasks": []})
         if _load_worker_doc_sqlite(store) is None:
@@ -657,6 +738,33 @@ def sqlite_shadow_parity_audit(store: TeamStore) -> dict[str, Any]:
     msg_sql = load_message_ledger_sqlite(store)
     ev_file = load_event_ledger_file(store)
     ev_sql = load_event_ledger_sqlite(store)
+    config_file = read_json(store.paths.config, {}) or {}
+    config_sql = _load_config_doc_sqlite(store) or {}
+    runtime_file = (
+        read_json(
+            store.paths.runtime,
+            {"state": "stopped", "event_seq": 0, "tmux_session": None},
+        )
+        or {"state": "stopped", "event_seq": 0, "tmux_session": None}
+    )
+    runtime_sql = _load_runtime_doc_sqlite(store) or {
+        "state": "stopped",
+        "event_seq": 0,
+        "tmux_session": None,
+    }
+    metrics_file = (
+        read_json(
+            store.paths.metrics,
+            {"snapshots": [], "checkpoints": [], "repairs": [], "replays": []},
+        )
+        or {"snapshots": [], "checkpoints": [], "repairs": [], "replays": []}
+    )
+    metrics_sql = _load_metrics_doc_sqlite(store) or {
+        "snapshots": [],
+        "checkpoints": [],
+        "repairs": [],
+        "replays": [],
+    }
     tasks_file = read_json(store.paths.tasks, {"tasks": []}) or {"tasks": []}
     tasks_sql = _load_tasks_doc_sqlite(store) or {"tasks": []}
     claims_file = _load_claims_from_files(store)
@@ -711,6 +819,18 @@ def sqlite_shadow_parity_audit(store: TeamStore) -> dict[str, Any]:
             "fileHash": _hash_rows(workers_file.get("workers", []) or []),
             "sqliteHash": _hash_rows(workers_sql.get("workers", []) or []),
         },
+        "config": {
+            "fileHash": _hash_rows([config_file]),
+            "sqliteHash": _hash_rows([config_sql]),
+        },
+        "runtime": {
+            "fileHash": _hash_rows([runtime_file]),
+            "sqliteHash": _hash_rows([runtime_sql]),
+        },
+        "metrics": {
+            "fileHash": _hash_rows([metrics_file]),
+            "sqliteHash": _hash_rows([metrics_sql]),
+        },
         "ok": True,
         "issues": [],
     }
@@ -745,6 +865,10 @@ def sqlite_shadow_parity_audit(store: TeamStore) -> dict[str, Any]:
         summary["issues"].append(
             f"workers count mismatch file={summary['workers']['fileCount']} sqlite={summary['workers']['sqliteCount']}"
         )
+    for section in ("config", "runtime", "metrics"):
+        if summary[section]["fileHash"] != summary[section]["sqliteHash"]:
+            summary["ok"] = False
+            summary["issues"].append(f"{section} hash mismatch")
     return summary
 
 
@@ -815,6 +939,33 @@ def _shadow_db_conn(store: TeamStore) -> sqlite3.Connection | None:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS tasks_doc_shadow (
+              singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+              payload_json TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS config_doc_shadow (
+              singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+              payload_json TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS runtime_doc_shadow (
+              singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+              payload_json TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS metrics_doc_shadow (
               singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
               payload_json TEXT NOT NULL,
               updated_at TEXT NOT NULL
@@ -955,11 +1106,83 @@ def _shadow_counts(store: TeamStore) -> dict[str, int | bool]:
         counts["workersSqlite"] = int(
             conn.execute("SELECT COUNT(*) FROM workers_shadow").fetchone()[0]
         )
+        counts["configSqlite"] = int(
+            conn.execute("SELECT COUNT(*) FROM config_doc_shadow").fetchone()[0]
+        )
+        counts["runtimeSqlite"] = int(
+            conn.execute("SELECT COUNT(*) FROM runtime_doc_shadow").fetchone()[0]
+        )
+        counts["metricsSqlite"] = int(
+            conn.execute("SELECT COUNT(*) FROM metrics_doc_shadow").fetchone()[0]
+        )
     except Exception:
         pass
     finally:
         conn.close()
     return counts
+
+
+def _shadow_sync_singleton_doc(
+    store: TeamStore, table: str, payload: dict[str, Any]
+) -> None:
+    conn = _shadow_db_conn(store)
+    if conn is None:
+        return
+    try:
+        conn.execute(
+            f"INSERT OR REPLACE INTO {table}(singleton_id, payload_json, updated_at) VALUES(1, ?, ?)",
+            (
+                json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                utc_now(),
+            ),
+        )
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
+
+def _shadow_load_singleton_doc(store: TeamStore, table: str) -> dict[str, Any] | None:
+    conn = _shadow_db_conn(store)
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            f"SELECT payload_json FROM {table} WHERE singleton_id = 1"
+        ).fetchone()
+        if not row or not row[0]:
+            return None
+        doc = json.loads(row[0])
+        return doc if isinstance(doc, dict) else None
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+
+def _shadow_sync_config(store: TeamStore, cfg: dict[str, Any]) -> None:
+    _shadow_sync_singleton_doc(store, "config_doc_shadow", cfg)
+
+
+def _shadow_sync_runtime(store: TeamStore, runtime_doc: dict[str, Any]) -> None:
+    _shadow_sync_singleton_doc(store, "runtime_doc_shadow", runtime_doc)
+
+
+def _shadow_sync_metrics(store: TeamStore, metrics_doc: dict[str, Any]) -> None:
+    _shadow_sync_singleton_doc(store, "metrics_doc_shadow", metrics_doc)
+
+
+def _load_config_doc_sqlite(store: TeamStore) -> dict[str, Any] | None:
+    return _shadow_load_singleton_doc(store, "config_doc_shadow")
+
+
+def _load_runtime_doc_sqlite(store: TeamStore) -> dict[str, Any] | None:
+    return _shadow_load_singleton_doc(store, "runtime_doc_shadow")
+
+
+def _load_metrics_doc_sqlite(store: TeamStore) -> dict[str, Any] | None:
+    return _shadow_load_singleton_doc(store, "metrics_doc_shadow")
 
 
 def _shadow_sync_tasks(store: TeamStore, tasks_doc: dict[str, Any]) -> None:
@@ -1148,18 +1371,50 @@ def claim_file_path(store: TeamStore, task_id: str) -> Path:
     return store.paths.claims_dir / f"{task_id}.json"
 
 
+def load_claims(store: TeamStore) -> list[dict[str, Any]]:
+    if feature_flag_enabled("sqlite_claims", False):
+        rows = _load_claims_from_sqlite(store)
+        if rows:
+            return rows
+    return _load_claims_from_files(store)
+
+
+def load_claim(store: TeamStore, task_id: str) -> dict[str, Any] | None:
+    task_id = str(task_id or "")
+    if not task_id:
+        return None
+    if feature_flag_enabled("sqlite_claims", False):
+        for row in _load_claims_from_sqlite(store):
+            if str(row.get("taskId") or "") == task_id:
+                return row
+    doc = read_json(claim_file_path(store, task_id), None)
+    return doc if isinstance(doc, dict) else None
+
+
+def save_claim(store: TeamStore, claim_doc: dict[str, Any]) -> None:
+    task_id = str(claim_doc.get("taskId") or "")
+    if not task_id:
+        raise ValueError("claim_doc.taskId is required")
+    write_json(claim_file_path(store, task_id), claim_doc)
+    _shadow_sync_claims(store)
+
+
+def delete_claim(store: TeamStore, task_id: str) -> None:
+    claim_file_path(store, str(task_id)).unlink(missing_ok=True)
+    _shadow_sync_claims(store)
+
+
 def expire_stale_claims(store: TeamStore) -> list[str]:
     expired: list[str] = []
     now = now_epoch()
-    for cf in store.paths.claims_dir.glob("*.json"):
-        data = read_json(cf, None)
+    for data in load_claims(store):
         if not isinstance(data, dict):
             continue
         exp = parse_ts(data.get("expiresAt"))
         if exp and exp < now:
             data["status"] = "expired"
-            write_json(cf, data)
-            expired.append(str(data.get("taskId") or cf.stem))
+            save_claim(store, data)
+            expired.append(str(data.get("taskId") or "unknown"))
     if not expired:
         return expired
 
@@ -1192,8 +1447,6 @@ def expire_stale_claims(store: TeamStore) -> list[str]:
         if changed:
             _refresh_task_blocked_state(doc)
             store.save_tasks(doc)
-    if expired:
-        _shadow_sync_claims(store)
     return expired
 
 
@@ -1213,8 +1466,7 @@ def refresh_member_claim_heartbeats(store: TeamStore, member_id: str) -> int:
                 continue
             if t.get("status") not in {"claimed", "in_progress"}:
                 continue
-            cf = claim_file_path(store, t.get("taskId"))
-            claim = read_json(cf, {}) or {}
+            claim = load_claim(store, t.get("taskId")) or {}
             claim.update(
                 {
                     "taskId": t.get("taskId"),
@@ -1227,10 +1479,8 @@ def refresh_member_claim_heartbeats(store: TeamStore, member_id: str) -> int:
                     "status": "active",
                 }
             )
-            write_json(cf, claim)
+            save_claim(store, claim)
             count += 1
-        if count:
-            _shadow_sync_claims(store)
     return count
 
 
@@ -2053,7 +2303,7 @@ def cmd_task_claim(args: argparse.Namespace) -> str:
             "previousOwner": previous_owner,
             "status": "active",
         }
-        write_json(claim_file_path(store, args.task_id), claim_doc)
+        save_claim(store, claim_doc)
         store.save_tasks(doc)
     store.emit_event(
         "TaskClaimed",
@@ -2139,9 +2389,7 @@ def cmd_task_update(args: argparse.Namespace) -> str:
             }
         )
         if target_status in {"completed", "cancelled", "pending", "blocked"}:
-            claim_file = claim_file_path(store, args.task_id)
-            if claim_file.exists():
-                claim_file.unlink(missing_ok=True)
+            delete_claim(store, args.task_id)
             if target_status in {"completed", "cancelled"}:
                 task["claimedBy"] = None
         _refresh_task_blocked_state(doc)
@@ -2192,9 +2440,7 @@ def cmd_task_release_claim(args: argparse.Namespace) -> str:
                 "force": bool(args.force),
             }
         )
-        cf = claim_file_path(store, args.task_id)
-        if cf.exists():
-            cf.unlink(missing_ok=True)
+        delete_claim(store, args.task_id)
         _refresh_task_blocked_state(doc)
         store.save_tasks(doc)
     store.emit_event(
@@ -2588,9 +2834,7 @@ def cmd_task_complete_with_outcome(args: argparse.Namespace) -> str:
                 "outcome": outcome,
             }
         )
-        cf = claim_file_path(store, args.task_id)
-        if cf.exists():
-            cf.unlink(missing_ok=True)
+        delete_claim(store, args.task_id)
         _refresh_task_blocked_state(doc)
         store.save_tasks(doc)
     store.emit_event(
@@ -3118,16 +3362,16 @@ def cmd_team_doctor(args: argparse.Namespace) -> str:
     # Tasks/claims consistency
     doc = store.load_tasks()
     for t in doc.get("tasks", []):
-        cf = claim_file_path(store, t.get("taskId"))
+        claim = load_claim(store, t.get("taskId"))
         if (
             t.get("claimedBy")
             and t.get("status") in {"claimed", "in_progress"}
-            and not cf.exists()
+            and not claim
         ):
-            findings.append(f"task {t.get('taskId')}: claimed but claim file missing")
-        if cf.exists() and (not t.get("claimedBy")):
+            findings.append(f"task {t.get('taskId')}: claimed but claim record missing")
+        if claim and (not t.get("claimedBy")):
             findings.append(
-                f"task {t.get('taskId')}: claim file exists but task unclaimed"
+                f"task {t.get('taskId')}: claim record exists but task unclaimed"
             )
     expired = expire_stale_claims(store)
     if expired:
@@ -4689,6 +4933,15 @@ def cmd_team_selftest(args: argparse.Namespace) -> str:
     except Exception as e:
         record("sqlite_shadow", False, str(e))
     try:
+        gate = _sqlite_parity_gate_eval(store)
+        record(
+            "sqlite_parity_gate",
+            (not gate.get("enabled")) or bool(gate.get("thresholdOk")),
+            f"enabled={gate.get('enabled')} teamFailures={gate.get('teamFailures')}/{gate.get('maxTeamFailures')} issueCount={gate.get('issueCount')}/{gate.get('maxIssueCount')}",
+        )
+    except Exception as e:
+        record("sqlite_parity_gate", False, str(e))
+    try:
         rt = store.load_runtime()
         tmux = rt.get("tmux_session")
         ok = True
@@ -4713,6 +4966,17 @@ def cmd_team_selftest(args: argparse.Namespace) -> str:
             "ts": utc_now(),
             "checks": checks,
             "status": "PASS" if all_ok else "FAIL",
+        },
+    )
+    _metrics_append(
+        store,
+        "snapshots",
+        {
+            "ts": utc_now(),
+            "kind": "selftest",
+            "status": "PASS" if all_ok else "FAIL",
+            "checkCount": len(checks),
+            "reportFile": str(out_file),
         },
     )
     store.emit_event(
@@ -4789,6 +5053,498 @@ def cmd_admin_sqlite_parity(args: argparse.Namespace) -> str:
         if a.get("issues"):
             for issue in a.get("issues", [])[:5]:
                 lines.append(f"  - {issue}")
+    return "\n".join(lines)
+
+
+def _sqlite_parity_gate_eval(store: TeamStore) -> dict[str, Any]:
+    flags = runtime_feature_flags()
+    gate_enabled = bool(flags.get("sqlite_parity_gate_enabled", True))
+    max_team_failures = int(flags.get("sqlite_parity_max_team_failures", 0) or 0)
+    max_issue_count = int(flags.get("sqlite_parity_max_issue_count", 0) or 0)
+    audit = sqlite_shadow_parity_audit(store)
+    team_failures = 0 if bool(audit.get("ok")) else 1
+    issue_count = len(audit.get("issues", []) or [])
+    threshold_ok = (
+        (team_failures <= max_team_failures) and (issue_count <= max_issue_count)
+    )
+    return {
+        "enabled": gate_enabled,
+        "maxTeamFailures": max_team_failures,
+        "maxIssueCount": max_issue_count,
+        "teamFailures": team_failures,
+        "issueCount": issue_count,
+        "ok": bool(audit.get("ok")),
+        "thresholdOk": threshold_ok,
+        "audit": audit,
+    }
+
+
+def _require_sqlite_parity_gate(
+    store: TeamStore, action: str, *, force: bool = False
+) -> dict[str, Any]:
+    gate = _sqlite_parity_gate_eval(store)
+    if gate["enabled"] and (not gate["thresholdOk"]) and not force:
+        raise SystemExit(
+            f"SQLite parity gate blocked {action}: teamFailures={gate['teamFailures']}/{gate['maxTeamFailures']} "
+            f"issueCount={gate['issueCount']}/{gate['maxIssueCount']}. Run `admin sqlite-parity` and repair or use --force."
+        )
+    return gate
+
+
+def _metrics_append(
+    store: TeamStore, bucket: str, row: dict[str, Any], *, keep: int = 200
+) -> None:
+    try:
+        metrics = store.load_metrics()
+        rows = metrics.get(bucket)
+        if not isinstance(rows, list):
+            rows = []
+        rows.append(row)
+        metrics[bucket] = rows[-keep:]
+        store.save_metrics(metrics)
+    except Exception:
+        pass
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _resync_message_shadow_from_files(store: TeamStore) -> None:
+    conn = _shadow_db_conn(store)
+    if conn is None:
+        return
+    try:
+        conn.execute("DELETE FROM messages_shadow")
+        for row in load_message_ledger_file(store):
+            payload = json.dumps(row, sort_keys=True, separators=(",", ":"))
+            row_hash = hashlib.sha1(payload.encode("utf-8")).hexdigest()
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO messages_shadow(
+                  row_hash, message_id, ts, status, priority, from_member, to_member, payload_json, inserted_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row_hash,
+                    row.get("id"),
+                    row.get("ts"),
+                    row.get("status"),
+                    row.get("priority"),
+                    row.get("fromMember"),
+                    row.get("toMember"),
+                    payload,
+                    utc_now(),
+                ),
+            )
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
+
+def _resync_event_shadow_from_files(store: TeamStore) -> None:
+    conn = _shadow_db_conn(store)
+    if conn is None:
+        return
+    try:
+        conn.execute("DELETE FROM events_shadow")
+        for e in load_event_ledger_file(store):
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO events_shadow(event_id, ts, event_type, payload_json, inserted_at)
+                VALUES(?, ?, ?, ?, ?)
+                """,
+                (
+                    int(e.get("id") or 0),
+                    str(e.get("ts") or utc_now()),
+                    str(e.get("type") or "Unknown"),
+                    json.dumps(e, sort_keys=True, separators=(",", ":")),
+                    utc_now(),
+                ),
+            )
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
+
+def _scan_jsonl_file(path: Path) -> dict[str, Any]:
+    out_rows: list[dict[str, Any]] = []
+    malformed = 0
+    total = 0
+    if not path.exists():
+        return {"rows": out_rows, "total": 0, "malformed": 0}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        total += 1
+        try:
+            row = json.loads(line)
+            if isinstance(row, dict):
+                out_rows.append(row)
+            else:
+                malformed += 1
+        except Exception:
+            malformed += 1
+    return {"rows": out_rows, "total": total, "malformed": malformed}
+
+
+def cmd_team_checkpoint(args: argparse.Namespace) -> str:
+    store = TeamStore(args.team_id)
+    if not store.exists():
+        raise SystemExit(f"Team {args.team_id} not found.")
+    gate = _require_sqlite_parity_gate(
+        store, "team checkpoint", force=bool(getattr(args, "force", False))
+    )
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    label = slugify(getattr(args, "label", None) or "checkpoint", "checkpoint")
+    out_dir = CHECKPOINTS_DIR / store.team_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = out_dir / f"{ts}-{label}.tar.gz"
+    include_shadow = bool(getattr(args, "include_shadow", True))
+    with tarfile.open(archive_path, "w:gz") as tf:
+        for p in sorted(store.paths.root.rglob("*")):
+            if not p.is_file():
+                continue
+            rel = p.relative_to(store.paths.root)
+            if not include_shadow and p == store.paths.shadow_db:
+                continue
+            tf.add(p, arcname=str(Path(store.team_id) / rel))
+    digest = _sha256_file(archive_path)
+    manifest = {
+        "team_id": store.team_id,
+        "ts": utc_now(),
+        "label": label,
+        "archive": str(archive_path),
+        "sha256": digest,
+        "includeShadow": include_shadow,
+        "parityGate": {
+            "enabled": gate["enabled"],
+            "thresholdOk": gate["thresholdOk"],
+            "teamFailures": gate["teamFailures"],
+            "issueCount": gate["issueCount"],
+        },
+        "parityAuditSummary": gate["audit"],
+    }
+    manifest_path = out_dir / f"{ts}-{label}.json"
+    write_json(manifest_path, manifest)
+    (archive_path.with_suffix(archive_path.suffix + ".sha256")).write_text(
+        f"{digest}  {archive_path.name}\n", encoding="utf-8"
+    )
+    _metrics_append(
+        store,
+        "checkpoints",
+        {
+            "ts": utc_now(),
+            "label": label,
+            "archive": str(archive_path),
+            "sha256": digest,
+            "parityGateOk": bool(gate["thresholdOk"]),
+        },
+    )
+    store.emit_event(
+        "TeamCheckpointCreated",
+        checkpointFile=str(archive_path),
+        manifestFile=str(manifest_path),
+        sha256=digest,
+        label=label,
+    )
+    payload = {
+        "ok": True,
+        "team_id": store.team_id,
+        "archive": str(archive_path),
+        "manifest": str(manifest_path),
+        "sha256": digest,
+        "parityGate": {
+            "enabled": gate["enabled"],
+            "thresholdOk": gate["thresholdOk"],
+            "teamFailures": gate["teamFailures"],
+            "issueCount": gate["issueCount"],
+        },
+    }
+    if getattr(args, "json", False):
+        return json.dumps(payload, indent=2)
+    return (
+        f"Checkpoint created for {store.team_id}: {archive_path} "
+        f"sha256={digest[:12]} parity_gate_ok={gate['thresholdOk']}"
+    )
+
+
+def cmd_admin_replay_events(args: argparse.Namespace) -> str:
+    store = TeamStore(args.team_id)
+    if not store.exists():
+        raise SystemExit(f"Team {args.team_id} not found.")
+    gate = _require_sqlite_parity_gate(
+        store, "admin replay-events", force=bool(getattr(args, "force", False))
+    )
+    events = load_event_ledger(store)
+    messages = load_message_ledger(store)
+    by_type: dict[str, int] = {}
+    last_id = 0
+    duplicate_ids = 0
+    non_monotonic = 0
+    seen_ids: set[int] = set()
+    task_state: dict[str, str] = {}
+    for e in events:
+        et = str(e.get("type") or "Unknown")
+        by_type[et] = by_type.get(et, 0) + 1
+        eid = int(e.get("id") or 0)
+        if eid in seen_ids:
+            duplicate_ids += 1
+        seen_ids.add(eid)
+        if eid and eid <= last_id:
+            non_monotonic += 1
+        last_id = max(last_id, eid)
+        tid = e.get("taskId")
+        if isinstance(tid, str) and tid:
+            if et in {"TaskClaimed"}:
+                task_state[tid] = "claimed"
+            elif et in {"TaskUpdated"} and e.get("status"):
+                task_state[tid] = str(e.get("status"))
+            elif et in {"TaskCompleted"}:
+                task_state[tid] = "completed"
+            elif et in {"TaskClaimReleased"}:
+                task_state[tid] = "pending"
+    msg_stats = _message_stats(store)
+    summary = {
+        "team_id": store.team_id,
+        "ts": utc_now(),
+        "parityGate": {
+            "enabled": gate["enabled"],
+            "thresholdOk": gate["thresholdOk"],
+            "teamFailures": gate["teamFailures"],
+            "issueCount": gate["issueCount"],
+        },
+        "events": {
+            "count": len(events),
+            "duplicateIds": duplicate_ids,
+            "nonMonotonicIds": non_monotonic,
+            "maxEventId": last_id,
+            "types": dict(sorted(by_type.items())),
+        },
+        "messages": {
+            "rows": len(messages),
+            "latestCount": len(latest_messages_by_id_from_rows(messages)),
+            "open": msg_stats.get("open"),
+            "staleOpen": msg_stats.get("staleOpen"),
+            "avgAckSeconds": msg_stats.get("avgAckSeconds"),
+        },
+        "derivedTaskStates": task_state,
+        "ok": duplicate_ids == 0 and non_monotonic == 0,
+    }
+    report_path = None
+    if getattr(args, "write_report", False):
+        report_dir = CLAUDE_DIR / "reports"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        report_path = report_dir / f"team-replay-events-{store.team_id}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+        write_json(report_path, summary)
+        summary["reportPath"] = str(report_path)
+    _metrics_append(
+        store,
+        "replays",
+        {
+            "ts": utc_now(),
+            "ok": bool(summary["ok"]),
+            "eventCount": len(events),
+            "duplicateIds": duplicate_ids,
+            "nonMonotonicIds": non_monotonic,
+            "reportPath": str(report_path) if report_path else None,
+        },
+    )
+    store.emit_event(
+        "TeamEventsReplayed",
+        ok=bool(summary["ok"]),
+        duplicateIds=duplicate_ids,
+        nonMonotonicIds=non_monotonic,
+        reportFile=str(report_path) if report_path else None,
+    )
+    if getattr(args, "json", False):
+        return json.dumps(summary, indent=2)
+    lines = [
+        f"## Team Event Replay: {store.team_id}",
+        f"- Status: {'PASS' if summary['ok'] else 'WARN'}",
+        f"- Events: {len(events)} (dup={duplicate_ids}, non_monotonic={non_monotonic})",
+        f"- Messages: {len(messages)} latest={summary['messages']['latestCount']} open={summary['messages']['open']} stale={summary['messages']['staleOpen']}",
+    ]
+    if report_path:
+        lines.append(f"- Report: {report_path}")
+    lines.append("")
+    lines.append("### Top Event Types")
+    for et, cnt in sorted(by_type.items(), key=lambda kv: (-kv[1], kv[0]))[:20]:
+        lines.append(f"- {et}: {cnt}")
+    return "\n".join(lines)
+
+
+def cmd_admin_repair_state(args: argparse.Namespace) -> str:
+    store = TeamStore(args.team_id)
+    if not store.exists():
+        raise SystemExit(f"Team {args.team_id} not found.")
+    apply = bool(getattr(args, "apply", False))
+    force = bool(getattr(args, "force", False))
+    gate = _require_sqlite_parity_gate(
+        store, "admin repair-state", force=force
+    )
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_dir = CLAUDE_DIR / "backups" / f"team-repair-{store.team_id}-{ts}"
+    report: dict[str, Any] = {
+        "team_id": store.team_id,
+        "ts": utc_now(),
+        "mode": "apply" if apply else "dry-run",
+        "parityGate": {
+            "enabled": gate["enabled"],
+            "thresholdOk": gate["thresholdOk"],
+            "teamFailures": gate["teamFailures"],
+            "issueCount": gate["issueCount"],
+        },
+        "actions": [],
+        "issues": [],
+    }
+
+    def backup_file(path: Path) -> None:
+        if not apply or not path.exists():
+            return
+        dst = backup_dir / path.relative_to(CLAUDE_DIR)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, dst)
+
+    def normalize_doc(path: Path, default_doc: dict[str, Any], validators: list[tuple[str, type]]):
+        raw = read_json(path, None)
+        if not isinstance(raw, dict):
+            report["issues"].append(f"{path.name}: invalid_json_or_not_object")
+            if apply:
+                backup_file(path)
+                write_json(path, default_doc)
+                report["actions"].append(f"reset:{path.name}")
+            return
+        changed = False
+        for key, typ in validators:
+            if not isinstance(raw.get(key), typ):
+                raw[key] = [] if typ is list else {} if typ is dict else default_doc.get(key)
+                changed = True
+        if changed and apply:
+            backup_file(path)
+            write_json(path, raw)
+            report["actions"].append(f"normalize:{path.name}")
+
+    normalize_doc(store.paths.config, {"members": []}, [("members", list)])
+    normalize_doc(
+        store.paths.runtime,
+        {"state": "stopped", "event_seq": 0, "tmux_session": None},
+        [],
+    )
+    normalize_doc(store.paths.tasks, {"tasks": []}, [("tasks", list)])
+    normalize_doc(store.paths.worker_map, {"workers": []}, [("workers", list)])
+    normalize_doc(
+        store.paths.metrics,
+        {"snapshots": [], "checkpoints": [], "repairs": [], "replays": []},
+        [("snapshots", list), ("checkpoints", list), ("repairs", list), ("replays", list)],
+    )
+
+    for path in [store.paths.events, store.paths.messages]:
+        scan = _scan_jsonl_file(path)
+        if int(scan["malformed"]) > 0:
+            report["issues"].append(f"{path.name}: malformed_jsonl={scan['malformed']}")
+            if apply:
+                backup_file(path)
+                write_jsonl(path, scan["rows"])
+                report["actions"].append(
+                    f"rewrite_jsonl:{path.name}:kept={len(scan['rows'])}:dropped={scan['malformed']}"
+                )
+
+    for cf in sorted(store.paths.claims_dir.glob("*.json")):
+        raw = read_json(cf, None)
+        if not isinstance(raw, dict):
+            report["issues"].append(f"claim:{cf.name}:invalid_json")
+            if apply:
+                backup_file(cf)
+                corrupt_dir = store.paths.claims_dir / "_corrupt"
+                corrupt_dir.mkdir(parents=True, exist_ok=True)
+                cf.rename(corrupt_dir / f"{cf.name}.{ts}.badjson")
+                report["actions"].append(f"quarantine_claim:{cf.name}")
+            continue
+        if not raw.get("taskId"):
+            raw["taskId"] = cf.stem
+            if apply:
+                backup_file(cf)
+                write_json(cf, raw)
+                report["actions"].append(f"claim_add_taskId:{cf.name}")
+
+    if apply:
+        try:
+            _shadow_sync_config(store, store.load_config())
+            _shadow_sync_runtime(store, store.load_runtime())
+            _shadow_sync_metrics(store, store.load_metrics())
+            _shadow_sync_tasks(store, read_json(store.paths.tasks, {"tasks": []}) or {"tasks": []})
+            _shadow_sync_workers(
+                store, read_json(store.paths.worker_map, {"workers": []}) or {"workers": []}
+            )
+            _shadow_sync_claims(store)
+            _resync_event_shadow_from_files(store)
+            _resync_message_shadow_from_files(store)
+            report["actions"].append("shadow_resync:all")
+        except Exception as e:
+            report["issues"].append(f"shadow_resync_failed:{e}")
+
+    report["ok"] = len(report["issues"]) == 0
+    report["backupDir"] = str(backup_dir) if apply else None
+    report_path = None
+    if getattr(args, "write_report", False):
+        rdir = CLAUDE_DIR / "reports"
+        rdir.mkdir(parents=True, exist_ok=True)
+        report_path = rdir / f"team-repair-state-{store.team_id}-{ts}.json"
+        write_json(report_path, report)
+        report["reportPath"] = str(report_path)
+
+    _metrics_append(
+        store,
+        "repairs",
+        {
+            "ts": utc_now(),
+            "mode": report["mode"],
+            "ok": bool(report["ok"]),
+            "issueCount": len(report["issues"]),
+            "actionCount": len(report["actions"]),
+            "reportPath": str(report_path) if report_path else None,
+        },
+    )
+    store.emit_event(
+        "TeamStateRepair",
+        mode=report["mode"],
+        ok=bool(report["ok"]),
+        issueCount=len(report["issues"]),
+        actionCount=len(report["actions"]),
+        reportFile=str(report_path) if report_path else None,
+    )
+    if getattr(args, "json", False):
+        return json.dumps(report, indent=2)
+    lines = [
+        f"## Team State Repair: {store.team_id}",
+        f"- Mode: {report['mode']}",
+        f"- Status: {'PASS' if report['ok'] else 'WARN'}",
+        f"- Issues: {len(report['issues'])}",
+        f"- Actions: {len(report['actions'])}",
+    ]
+    if report_path:
+        lines.append(f"- Report: {report_path}")
+    if apply:
+        lines.append(f"- Backup Dir: {backup_dir}")
+    if report["issues"]:
+        lines.append("")
+        lines.append("### Issues")
+        for item in report["issues"][:40]:
+            lines.append(f"- {item}")
+    if report["actions"]:
+        lines.append("")
+        lines.append("### Actions")
+        for item in report["actions"][:40]:
+            lines.append(f"- {item}")
     return "\n".join(lines)
 
 
@@ -5008,12 +5764,11 @@ def cmd_team_replace_member(args: argparse.Namespace) -> str:
                     }
                 )
                 transferred_tasks.append(str(t.get("taskId")))
-                cf = claim_file_path(store, t.get("taskId"))
-                if cf.exists():
-                    claim = read_json(cf, {}) or {}
+                claim = load_claim(store, t.get("taskId"))
+                if claim:
                     claim["claimedBy"] = new_id
                     claim["previousOwner"] = old_id
-                    write_json(cf, claim)
+                    save_claim(store, claim)
         store.save_tasks(doc)
 
     wm = _load_worker_map(store)
@@ -5860,6 +6615,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     t_announce.add_argument("--sticky", action="store_true")
 
+    # Phase E: checkpoints
+    t_checkpoint = team_sp.add_parser("checkpoint")
+    t_checkpoint.add_argument("--team-id", required=True)
+    t_checkpoint.add_argument("--label")
+    t_checkpoint.add_argument("--json", action="store_true")
+    t_checkpoint.add_argument("--force", action="store_true")
+    t_checkpoint.add_argument(
+        "--no-shadow", dest="include_shadow", action="store_false", default=True
+    )
+
     # member
     member = sp.add_parser("member")
     member_sp = member.add_subparsers(dest="action", required=True)
@@ -6099,6 +6864,19 @@ def build_parser() -> argparse.ArgumentParser:
     a_sqlp.add_argument("--json", action="store_true")
     a_sqlp.add_argument("--write-report", action="store_true")
 
+    a_replay = adm_sp.add_parser("replay-events")
+    a_replay.add_argument("--team-id", required=True)
+    a_replay.add_argument("--json", action="store_true")
+    a_replay.add_argument("--write-report", action="store_true")
+    a_replay.add_argument("--force", action="store_true")
+
+    a_repair = adm_sp.add_parser("repair-state")
+    a_repair.add_argument("--team-id", required=True)
+    a_repair.add_argument("--apply", action="store_true")
+    a_repair.add_argument("--json", action="store_true")
+    a_repair.add_argument("--write-report", action="store_true")
+    a_repair.add_argument("--force", action="store_true")
+
     # hook
     hook = sp.add_parser("hook")
     hook_sp = hook.add_subparsers(dest="action", required=True)
@@ -6182,6 +6960,8 @@ def dispatch(args: argparse.Namespace) -> str:
         return cmd_team_auto_scale_loop(args)
     if d == "team" and a == "announce":
         return cmd_team_announce(args)
+    if d == "team" and a == "checkpoint":
+        return cmd_team_checkpoint(args)
     if d == "member" and a == "add":
         return cmd_member_add(args)
     if d == "member" and a == "attach-session":
@@ -6244,6 +7024,10 @@ def dispatch(args: argparse.Namespace) -> str:
         return cmd_team_selftest(args)
     if d == "admin" and a == "sqlite-parity":
         return cmd_admin_sqlite_parity(args)
+    if d == "admin" and a == "replay-events":
+        return cmd_admin_replay_events(args)
+    if d == "admin" and a == "repair-state":
+        return cmd_admin_repair_state(args)
     if d == "hook" and a == "session-start":
         return cmd_hook_session_start(args)
     if d == "hook" and a == "heartbeat":
