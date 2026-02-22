@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Observability suite: health reports, timelines, SLO metrics, parity history, audit trails."""
+
 from __future__ import annotations
 
 import argparse
 import json
-import re
 import subprocess
 import sys
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -15,21 +15,40 @@ HOME = Path.home()
 CLAUDE = HOME / ".claude"
 TEAMS_DIR = CLAUDE / "teams"
 REPORTS = CLAUDE / "reports"
+GOV = CLAUDE / "governance"
+INBOX_DIR = CLAUDE / "terminals" / "inbox"
 COST_RUNTIME = CLAUDE / "scripts" / "cost_runtime.py"
 PARITY_AUDIT = CLAUDE / "scripts" / "parity_audit.py"
 TRUST_AUDIT = CLAUDE / "scripts" / "trust_audit.py"
 SLO_HISTORY = REPORTS / "slo-history.jsonl"
 PARITY_HISTORY = REPORTS / "parity-history.jsonl"
+ALERT_HISTORY = REPORTS / "slo-alerts.jsonl"
+ALERT_STATE = REPORTS / "slo-alert-state.json"
+SLO_THRESHOLDS = GOV / "slo-thresholds.json"
 
 AUDIT_EVENT_TYPES = {
-    "recovery_hard", "force_claim", "interrupt", "replace_member",
-    "archive", "destroy", "restart_member", "teardown", "scale",
-    "auto_heal", "recover", "gc",
+    "recovery_hard",
+    "force_claim",
+    "interrupt",
+    "replace_member",
+    "archive",
+    "destroy",
+    "restart_member",
+    "teardown",
+    "scale",
+    "auto_heal",
+    "recover",
+    "gc",
 }
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
 def now_epoch() -> float:
@@ -65,13 +84,21 @@ def append_jsonl(path: Path, row: dict[str, Any]) -> None:
         f.write(json.dumps(row, separators=(",", ":")) + "\n")
 
 
+def write_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n")
+
+
 def run_script(script: Path, *args: str, timeout: int = 30) -> tuple[int, str]:
     if not script.exists():
         return 1, f"script not found: {script}"
     try:
         cp = subprocess.run(
             ["python3", str(script), *args],
-            capture_output=True, text=True, timeout=timeout, check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
         )
         return cp.returncode, (cp.stdout + cp.stderr).strip()
     except Exception as e:
@@ -99,7 +126,183 @@ def format_age(seconds: float) -> str:
     return f"{s // 86400}d"
 
 
+def load_slo_thresholds() -> dict[str, Any]:
+    defaults = {
+        "cooldown_seconds": 900,
+        "ack_latency_p95_warn_seconds": 900,
+        "ack_latency_p95_crit_seconds": 3600,
+        "recovery_time_warn_seconds": 1800,
+        "recovery_time_crit_seconds": 7200,
+        "task_completion_warn_seconds": 21600,
+        "task_completion_crit_seconds": 86400,
+        "restart_rate_24h_warn": 3,
+        "restart_rate_24h_crit": 6,
+        "failure_rate_24h_warn": 3,
+        "failure_rate_24h_crit": 6,
+    }
+    data = read_json(SLO_THRESHOLDS, {})
+    if not isinstance(data, dict):
+        data = {}
+    merged = dict(defaults)
+    merged.update({k: v for k, v in data.items() if v is not None})
+    return merged
+
+
+def _alert_key(alert: dict[str, Any]) -> str:
+    return f"{alert.get('team','*')}|{alert.get('type')}|{alert.get('metric')}"
+
+
+def _inbox_targets(limit: int = 25) -> list[Path]:
+    if not INBOX_DIR.exists():
+        return []
+    files = [p for p in INBOX_DIR.glob("*.jsonl") if not p.name.endswith(".processed")]
+    return sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)[:limit]
+
+
+def _deliver_alerts_to_inbox(alerts: list[dict[str, Any]]) -> int:
+    if not alerts:
+        return 0
+    payloads = []
+    ts = utc_now()
+    for a in alerts:
+        payloads.append(
+            {
+                "ts": ts,
+                "from": "system",
+                "priority": "high" if a.get("severity") == "critical" else "normal",
+                "content": f"[SLO ALERT] {a.get('team','-')}: {a.get('message','')}",
+                "type": "slo_alert",
+                "alert_type": a.get("type"),
+                "metric": a.get("metric"),
+            }
+        )
+    delivered = 0
+    for inbox in _inbox_targets():
+        try:
+            with inbox.open("a", encoding="utf-8") as f:
+                for row in payloads:
+                    f.write(json.dumps(row, separators=(",", ":")) + "\n")
+            delivered += 1
+        except Exception:
+            continue
+    return delivered
+
+
+def _load_alert_state() -> dict[str, Any]:
+    data = read_json(ALERT_STATE, {})
+    if not isinstance(data, dict):
+        return {"last_sent": {}, "last_eval": None}
+    data.setdefault("last_sent", {})
+    return data
+
+
+def _save_alert_state(state: dict[str, Any]) -> None:
+    write_json(ALERT_STATE, state)
+
+
+def _slo_alert_candidates(metrics: dict[str, Any], thresholds: dict[str, Any]) -> list[dict[str, Any]]:
+    alerts: list[dict[str, Any]] = []
+    for team_id, tm in (metrics.get("teams") or {}).items():
+        checks = [
+            ("ack_latency_p95", tm.get("ack_latency_p95"), "seconds", "ack_latency_p95_"),
+            ("recovery_time_avg", tm.get("recovery_time_avg"), "seconds", "recovery_time_"),
+            ("task_completion_p95", tm.get("task_completion_p95"), "seconds", "task_completion_"),
+            ("restart_rate_24h", tm.get("restart_rate_24h"), "count", "restart_rate_24h_"),
+            ("failure_rate_24h", tm.get("failure_rate_24h"), "count", "failure_rate_24h_"),
+        ]
+        for metric, value, unit, prefix in checks:
+            if value is None:
+                continue
+            warn_key = f"{prefix}warn_seconds" if unit == "seconds" else f"{prefix}warn"
+            crit_key = f"{prefix}crit_seconds" if unit == "seconds" else f"{prefix}crit"
+            warn = thresholds.get(warn_key)
+            crit = thresholds.get(crit_key)
+            severity = None
+            if crit is not None and value >= crit:
+                severity = "critical"
+            elif warn is not None and value >= warn:
+                severity = "warning"
+            if severity:
+                val_fmt = format_age(value) if unit == "seconds" else str(int(value))
+                thr_fmt = format_age(crit if severity == "critical" else warn) if unit == "seconds" else str(int(crit if severity == "critical" else warn))
+                alerts.append(
+                    {
+                        "ts": utc_now(),
+                        "team": team_id,
+                        "type": "slo_breach",
+                        "metric": metric,
+                        "severity": severity,
+                        "value": value,
+                        "threshold": crit if severity == "critical" else warn,
+                        "message": f"{metric}={val_fmt} breached {severity} threshold {thr_fmt}",
+                    }
+                )
+    return alerts
+
+
+def evaluate_slo_alerts(deliver: bool = True) -> dict[str, Any]:
+    thresholds = load_slo_thresholds()
+    metrics = _compute_slo_metrics()
+    append_jsonl(SLO_HISTORY, metrics)
+
+    candidates = _slo_alert_candidates(metrics, thresholds)
+    state = _load_alert_state()
+    cooldown = int(thresholds.get("cooldown_seconds", 900))
+    now = now_epoch()
+    emitted: list[dict[str, Any]] = []
+    suppressed: list[dict[str, Any]] = []
+    last_sent = state.get("last_sent", {})
+    for a in candidates:
+        key = _alert_key(a)
+        last = float(last_sent.get(key, 0) or 0)
+        if now - last < cooldown:
+            suppressed.append(a)
+            continue
+        emitted.append(a)
+        last_sent[key] = now
+        append_jsonl(ALERT_HISTORY, a)
+
+    delivered_targets = 0
+    if deliver and emitted:
+        delivered_targets = _deliver_alerts_to_inbox(emitted)
+
+    state["last_sent"] = last_sent
+    state["last_eval"] = utc_now()
+    state["last_eval_summary"] = {
+        "candidate_count": len(candidates),
+        "emitted_count": len(emitted),
+        "suppressed_count": len(suppressed),
+        "delivered_targets": delivered_targets,
+    }
+    _save_alert_state(state)
+
+    return {
+        "status": "ok",
+        "thresholds": thresholds,
+        "metrics_timestamp": metrics.get("timestamp"),
+        "candidate_count": len(candidates),
+        "emitted_count": len(emitted),
+        "suppressed_count": len(suppressed),
+        "delivered_targets": delivered_targets,
+        "alerts": emitted,
+        "suppressed": suppressed[:20],
+    }
+
+
+def alerts_status() -> dict[str, Any]:
+    state = _load_alert_state()
+    recent = read_jsonl(ALERT_HISTORY)[-20:]
+    return {
+        "status": "ok",
+        "thresholds": load_slo_thresholds(),
+        "state": state,
+        "recent_alerts": recent,
+        "recent_alert_count": len(recent),
+    }
+
+
 # --- Team data helpers ---
+
 
 def list_teams() -> list[dict[str, Any]]:
     teams = []
@@ -110,13 +313,15 @@ def list_teams() -> list[dict[str, Any]]:
             continue
         cfg = read_json(d / "config.json", {})
         rt = read_json(d / "runtime.json", {})
-        teams.append({
-            "id": d.name,
-            "name": cfg.get("name", d.name),
-            "state": rt.get("state", "unknown"),
-            "members": cfg.get("members", []),
-            "tmux": rt.get("tmux_session"),
-        })
+        teams.append(
+            {
+                "id": d.name,
+                "name": cfg.get("name", d.name),
+                "state": rt.get("state", "unknown"),
+                "members": cfg.get("members", []),
+                "tmux": rt.get("tmux_session"),
+            }
+        )
     return teams
 
 
@@ -139,6 +344,7 @@ def team_messages(team_id: str) -> list[dict[str, Any]]:
 # health-report
 # ============================================================
 
+
 def cmd_health_report(args: argparse.Namespace) -> int:
     REPORTS.mkdir(parents=True, exist_ok=True)
     ts = utc_now()
@@ -148,7 +354,9 @@ def cmd_health_report(args: argparse.Namespace) -> int:
     runtime_rows = []
     for t in teams:
         member_count = len(t.get("members", []))
-        runtime_rows.append(f"| {t['id']} | {t['name']} | {t['state']} | {member_count} | {t.get('tmux') or '-'} |")
+        runtime_rows.append(
+            f"| {t['id']} | {t['name']} | {t['state']} | {member_count} | {t.get('tmux') or '-'} |"
+        )
 
     # Task summary across all teams
     total_tasks = {"pending": 0, "in_progress": 0, "done": 0, "blocked": 0}
@@ -185,16 +393,26 @@ def cmd_health_report(args: argparse.Namespace) -> int:
     # Trust audit
     trust_json = read_json(REPORTS / "trust-audit-latest.json", {})
 
-    # Alerts
+    # Alerts (health-state + SLO alerts)
     alerts = []
     for t in teams:
         if t["state"] not in ("running", "stopped", "paused"):
             alerts.append(f"Team {t['id']} in unexpected state: {t['state']}")
         for m in t.get("members", []):
             if m.get("status") == "error":
-                alerts.append(f"Member {m.get('name', m.get('id', '?'))} in team {t['id']} has error status")
+                alerts.append(
+                    f"Member {m.get('name', m.get('id', '?'))} in team {t['id']} has error status"
+                )
     if trust_json.get("tier2_unapproved"):
-        alerts.append(f"Unapproved tier-2 plugins: {', '.join(trust_json['tier2_unapproved'])}")
+        alerts.append(
+            f"Unapproved tier-2 plugins: {', '.join(trust_json['tier2_unapproved'])}"
+        )
+    alert_status = alerts_status()
+    recent_slo = alert_status.get("recent_alerts", [])
+    for a in recent_slo[-10:]:
+        alerts.append(
+            f"SLO {a.get('severity','?')} {a.get('team','?')} {a.get('metric','?')}: {a.get('message','')}"
+        )
 
     # Build report
     lines = [
@@ -225,7 +443,9 @@ def cmd_health_report(args: argparse.Namespace) -> int:
         for ev in recent_events[-50:]:
             ev_ts_str = ev.get("ts") or ev.get("timestamp") or "?"
             ev_type = ev.get("type") or ev.get("event_type") or "?"
-            lines.append(f"- `{ev_ts_str}` **{ev_type}** ({ev.get('_team', '?')}): {ev.get('detail', ev.get('summary', ''))}")
+            lines.append(
+                f"- `{ev_ts_str}` **{ev_type}** ({ev.get('_team', '?')}): {ev.get('detail', ev.get('summary', ''))}"
+            )
     else:
         lines.append("No events in last 24h.")
 
@@ -255,14 +475,18 @@ def cmd_health_report(args: argparse.Namespace) -> int:
         lines.append("|----------|-------|--------:|---------|")
         for cat, v in cats.items():
             missing = ", ".join(v.get("missing", [])) or "-"
-            lines.append(f"| {cat} | {v.get('grade', '?')} | {v.get('presentCount', 0)}/{v.get('requiredCount', 0)} | {missing} |")
+            lines.append(
+                f"| {cat} | {v.get('grade', '?')} | {v.get('presentCount', 0)}/{v.get('requiredCount', 0)} | {missing} |"
+            )
     else:
         lines.append("No parity data. Run `parity_audit.py` first.")
 
     lines += ["", "## Trust", ""]
     if trust_json:
         s = trust_json.get("summary", {})
-        lines.append(f"- Tier 0: {s.get('tier0', 0)}, Tier 1: {s.get('tier1', 0)}, Tier 2: {s.get('tier2', 0)}")
+        lines.append(
+            f"- Tier 0: {s.get('tier0', 0)}, Tier 1: {s.get('tier1', 0)}, Tier 2: {s.get('tier2', 0)}"
+        )
     else:
         lines.append("No trust data. Run `trust_audit.py` first.")
 
@@ -274,10 +498,19 @@ def cmd_health_report(args: argparse.Namespace) -> int:
 
     report_data = {
         "generated": ts,
-        "teams": [{"id": t["id"], "name": t["name"], "state": t["state"], "members": len(t.get("members", []))} for t in teams],
+        "teams": [
+            {
+                "id": t["id"],
+                "name": t["name"],
+                "state": t["state"],
+                "members": len(t.get("members", [])),
+            }
+            for t in teams
+        ],
         "tasks": total_tasks,
         "event_count_24h": len(recent_events),
         "alerts": alerts,
+        "slo_alert_status": alert_status.get("state", {}),
         "parity": cats,
     }
     json_path.write_text(json.dumps(report_data, indent=2) + "\n")
@@ -292,6 +525,7 @@ def cmd_health_report(args: argparse.Namespace) -> int:
 # ============================================================
 # timeline
 # ============================================================
+
 
 def cmd_timeline(args: argparse.Namespace) -> int:
     REPORTS.mkdir(parents=True, exist_ok=True)
@@ -311,7 +545,17 @@ def cmd_timeline(args: argparse.Namespace) -> int:
         ev_ts = parse_ts(ev.get("ts") or ev.get("timestamp"))
         if ev_ts >= cutoff:
             ev_type = ev.get("type") or ev.get("event_type") or "event"
-            detail = ev.get("detail") or ev.get("summary") or json.dumps({k: v for k, v in ev.items() if k not in ("ts", "timestamp", "type", "event_type", "id")})
+            detail = (
+                ev.get("detail")
+                or ev.get("summary")
+                or json.dumps(
+                    {
+                        k: v
+                        for k, v in ev.items()
+                        if k not in ("ts", "timestamp", "type", "event_type", "id")
+                    }
+                )
+            )
             entries.append((ev_ts, ev_type, str(detail)[:200]))
 
     # Messages
@@ -330,7 +574,13 @@ def cmd_timeline(args: argparse.Namespace) -> int:
             ts_val = parse_ts(task.get(field))
             if ts_val >= cutoff:
                 action = field.replace("_at", "").replace("_", " ")
-                entries.append((ts_val, f"task_{action}", f"{task.get('id', '?')}: {task.get('title', task.get('name', '?'))}"))
+                entries.append(
+                    (
+                        ts_val,
+                        f"task_{action}",
+                        f"{task.get('id', '?')}: {task.get('title', task.get('name', '?'))}",
+                    )
+                )
 
     entries.sort(key=lambda x: x[0])
 
@@ -353,7 +603,11 @@ def cmd_timeline(args: argparse.Namespace) -> int:
     out_path.write_text(md)
 
     if getattr(args, "json", False):
-        print(json.dumps({"team": team_id, "entries": len(entries), "path": str(out_path)}))
+        print(
+            json.dumps(
+                {"team": team_id, "entries": len(entries), "path": str(out_path)}
+            )
+        )
     else:
         print(md)
     return 0
@@ -362,6 +616,7 @@ def cmd_timeline(args: argparse.Namespace) -> int:
 # ============================================================
 # slo
 # ============================================================
+
 
 def _compute_slo_metrics() -> dict[str, Any]:
     now = now_epoch()
@@ -405,9 +660,22 @@ def _compute_slo_metrics() -> dict[str, Any]:
 
         # Restart rate (events in last 24h)
         day_cutoff = now - 86400
-        day_events = [e for e in events if parse_ts(e.get("ts") or e.get("timestamp")) >= day_cutoff]
-        restart_count = sum(1 for e in day_events if "restart" in (e.get("type") or e.get("event_type") or "").lower())
-        failure_count = sum(1 for e in day_events if "fail" in (e.get("type") or e.get("event_type") or "").lower() or "error" in (e.get("type") or e.get("event_type") or "").lower())
+        day_events = [
+            e
+            for e in events
+            if parse_ts(e.get("ts") or e.get("timestamp")) >= day_cutoff
+        ]
+        restart_count = sum(
+            1
+            for e in day_events
+            if "restart" in (e.get("type") or e.get("event_type") or "").lower()
+        )
+        failure_count = sum(
+            1
+            for e in day_events
+            if "fail" in (e.get("type") or e.get("event_type") or "").lower()
+            or "error" in (e.get("type") or e.get("event_type") or "").lower()
+        )
 
         def avg(lst: list[float]) -> float | None:
             return sum(lst) / len(lst) if lst else None
@@ -450,7 +718,9 @@ def cmd_slo(args: argparse.Namespace) -> int:
         recent = history[-7:] if len(history) >= 7 else history
 
         if getattr(args, "json", False):
-            print(json.dumps({"latest": metrics, "history_count": len(history)}, indent=2))
+            print(
+                json.dumps({"latest": metrics, "history_count": len(history)}, indent=2)
+            )
             return 0
 
         lines = ["# SLO Metrics Report", "", f"Generated: {utc_now()}", ""]
@@ -478,13 +748,24 @@ def cmd_slo(args: argparse.Namespace) -> int:
             lines.append("|------|------:|--------:|---------:|")
             for snap in recent:
                 ts_str = snap.get("timestamp", "?")[:10]
-                total_restarts = sum(t.get("restart_rate_24h", 0) for t in snap.get("teams", {}).values())
-                total_failures = sum(t.get("failure_rate_24h", 0) for t in snap.get("teams", {}).values())
-                lines.append(f"| {ts_str} | {len(snap.get('teams', {}))} | {total_restarts} | {total_failures} |")
+                total_restarts = sum(
+                    t.get("restart_rate_24h", 0) for t in snap.get("teams", {}).values()
+                )
+                total_failures = sum(
+                    t.get("failure_rate_24h", 0) for t in snap.get("teams", {}).values()
+                )
+                lines.append(
+                    f"| {ts_str} | {len(snap.get('teams', {}))} | {total_restarts} | {total_failures} |"
+                )
 
         print("\n".join(lines))
     else:
-        print(json.dumps({"status": "snapshot_recorded", "teams": len(metrics.get("teams", {}))}, indent=2))
+        print(
+            json.dumps(
+                {"status": "snapshot_recorded", "teams": len(metrics.get("teams", {}))},
+                indent=2,
+            )
+        )
 
     return 0
 
@@ -492,6 +773,7 @@ def cmd_slo(args: argparse.Namespace) -> int:
 # ============================================================
 # parity-history
 # ============================================================
+
 
 def cmd_parity_history(args: argparse.Namespace) -> int:
     REPORTS.mkdir(parents=True, exist_ok=True)
@@ -509,7 +791,10 @@ def cmd_parity_history(args: argparse.Namespace) -> int:
         if latest:
             cats = latest.get("categories", {})
             grades = {cat: v.get("grade", "?") for cat, v in cats.items()}
-            overall_scores = [v.get("presentCount", 0) / max(v.get("requiredCount", 1), 1) for v in cats.values()]
+            overall_scores = [
+                v.get("presentCount", 0) / max(v.get("requiredCount", 1), 1)
+                for v in cats.values()
+            ]
             overall = sum(overall_scores) / len(overall_scores) if overall_scores else 0
             entry = {
                 "timestamp": utc_now(),
@@ -518,7 +803,11 @@ def cmd_parity_history(args: argparse.Namespace) -> int:
             }
             append_jsonl(PARITY_HISTORY, entry)
             if not report_only:
-                print(json.dumps({"status": "recorded", "overall": entry["overall"]}, indent=2))
+                print(
+                    json.dumps(
+                        {"status": "recorded", "overall": entry["overall"]}, indent=2
+                    )
+                )
                 return 0
 
     # Report
@@ -552,8 +841,59 @@ def cmd_parity_history(args: argparse.Namespace) -> int:
 
 
 # ============================================================
+# alerts / slo-loop
+# ============================================================
+
+
+def cmd_alerts(args: argparse.Namespace) -> int:
+    action = getattr(args, "action", "status")
+    if action == "evaluate":
+        result = evaluate_slo_alerts(deliver=not getattr(args, "no_deliver", False))
+    else:
+        result = alerts_status()
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"Alert status: {result.get('status','?')}")
+        if action == "evaluate":
+            print(
+                f"Candidates={result.get('candidate_count',0)} emitted={result.get('emitted_count',0)} suppressed={result.get('suppressed_count',0)} delivered_targets={result.get('delivered_targets',0)}"
+            )
+            for a in result.get("alerts", [])[:20]:
+                print(f"- [{a.get('severity','?')}] {a.get('team','?')} {a.get('metric','?')}: {a.get('message','')}")
+        else:
+            state = result.get("state", {})
+            print(f"Last eval: {state.get('last_eval') or '-'}")
+            for a in result.get("recent_alerts", [])[-10:]:
+                print(f"- [{a.get('severity','?')}] {a.get('team','?')} {a.get('metric','?')}: {a.get('message','')}")
+    return 0
+
+
+def cmd_slo_loop(args: argparse.Namespace) -> int:
+    import time
+
+    interval = max(10, int(getattr(args, "interval", 300)))
+    once = bool(getattr(args, "once", False))
+    max_iter = int(getattr(args, "iterations", 0) or 0)
+    i = 0
+    while True:
+        result = evaluate_slo_alerts(deliver=not getattr(args, "no_deliver", False))
+        if getattr(args, "json", False):
+            print(json.dumps({"iteration": i + 1, **result}, indent=2))
+        else:
+            print(
+                f"[{utc_now()}] slo-loop iteration={i+1} emitted={result.get('emitted_count',0)} candidates={result.get('candidate_count',0)}"
+            )
+        i += 1
+        if once or (max_iter and i >= max_iter):
+            return 0
+        time.sleep(interval)
+
+
+# ============================================================
 # audit-trail
 # ============================================================
+
 
 def cmd_audit_trail(args: argparse.Namespace) -> int:
     REPORTS.mkdir(parents=True, exist_ok=True)
@@ -567,14 +907,22 @@ def cmd_audit_trail(args: argparse.Namespace) -> int:
             ev_type = (ev.get("type") or ev.get("event_type") or "").lower()
             ev_ts = parse_ts(ev.get("ts") or ev.get("timestamp"))
             if ev_ts >= cutoff and any(at in ev_type for at in AUDIT_EVENT_TYPES):
-                audit_entries.append({
-                    "timestamp": ev.get("ts") or ev.get("timestamp") or "?",
-                    "team": t["id"],
-                    "action": ev_type,
-                    "actor": ev.get("actor") or ev.get("by") or ev.get("member_id") or "-",
-                    "target": ev.get("target") or ev.get("member") or ev.get("task_id") or "-",
-                    "detail": (ev.get("detail") or ev.get("summary") or "")[:200],
-                })
+                audit_entries.append(
+                    {
+                        "timestamp": ev.get("ts") or ev.get("timestamp") or "?",
+                        "team": t["id"],
+                        "action": ev_type,
+                        "actor": ev.get("actor")
+                        or ev.get("by")
+                        or ev.get("member_id")
+                        or "-",
+                        "target": ev.get("target")
+                        or ev.get("member")
+                        or ev.get("task_id")
+                        or "-",
+                        "detail": (ev.get("detail") or ev.get("summary") or "")[:200],
+                    }
+                )
 
     audit_entries.sort(key=lambda e: e["timestamp"])
 
@@ -587,7 +935,9 @@ def cmd_audit_trail(args: argparse.Namespace) -> int:
         "|-----------|------|--------|-------|--------|--------|",
     ]
     for e in audit_entries:
-        lines.append(f"| {e['timestamp']} | {e['team']} | {e['action']} | {e['actor']} | {e['target']} | {e['detail']} |")
+        lines.append(
+            f"| {e['timestamp']} | {e['team']} | {e['action']} | {e['actor']} | {e['target']} | {e['detail']} |"
+        )
 
     if not audit_entries:
         lines.append("| - | - | - | - | - | No audit events in period |")
@@ -598,7 +948,9 @@ def cmd_audit_trail(args: argparse.Namespace) -> int:
     out_path.write_text(md)
 
     if getattr(args, "json", False):
-        print(json.dumps({"entries": len(audit_entries), "path": str(out_path)}, indent=2))
+        print(
+            json.dumps({"entries": len(audit_entries), "path": str(out_path)}, indent=2)
+        )
     else:
         print(md)
     return 0
@@ -607,6 +959,7 @@ def cmd_audit_trail(args: argparse.Namespace) -> int:
 # ============================================================
 # CLI
 # ============================================================
+
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="observability", description="Observability suite")
@@ -617,18 +970,41 @@ def build_parser() -> argparse.ArgumentParser:
 
     tl = sub.add_parser("timeline", help="Chronological team timeline")
     tl.add_argument("--team", required=True, help="Team ID")
-    tl.add_argument("--hours", type=int, default=24, help="Hours to look back (default 24)")
+    tl.add_argument(
+        "--hours", type=int, default=24, help="Hours to look back (default 24)"
+    )
     tl.add_argument("--json", action="store_true")
 
     slo = sub.add_parser("slo", help="Record SLO metrics snapshot")
-    slo.add_argument("--report", action="store_true", help="Show report instead of recording")
+    slo.add_argument(
+        "--report", action="store_true", help="Show report instead of recording"
+    )
     slo.add_argument("--json", action="store_true")
+
+    al = sub.add_parser("alerts", help="Evaluate or show SLO alerts")
+    al.add_argument("action", nargs="?", choices=["status", "evaluate"], default="status")
+    al.add_argument("--json", action="store_true")
+    al.add_argument("--no-deliver", action="store_true", help="Do not write inbox notifications")
+
+    sl = sub.add_parser("slo-loop", help="Continuous SLO/alert evaluation loop")
+    sl.add_argument("--interval", type=int, default=300, help="Polling interval seconds (default 300)")
+    sl.add_argument("--iterations", type=int, default=0, help="Stop after N iterations (0 = forever)")
+    sl.add_argument("--once", action="store_true", help="Run one iteration and exit")
+    sl.add_argument("--no-deliver", action="store_true")
+    sl.add_argument("--json", action="store_true")
 
     ph = sub.add_parser("parity-history", help="Record/show parity grade history")
     ph.add_argument("--report", action="store_true", help="Show trend report")
 
-    at = sub.add_parser("audit-trail", help="Export audit trail of sensitive operations")
-    at.add_argument("--hours", type=int, default=168, help="Hours to look back (default 168 = 7 days)")
+    at = sub.add_parser(
+        "audit-trail", help="Export audit trail of sensitive operations"
+    )
+    at.add_argument(
+        "--hours",
+        type=int,
+        default=168,
+        help="Hours to look back (default 168 = 7 days)",
+    )
     at.add_argument("--json", action="store_true")
 
     return p
@@ -645,6 +1021,8 @@ def main() -> int:
         "health-report": cmd_health_report,
         "timeline": cmd_timeline,
         "slo": cmd_slo,
+        "alerts": cmd_alerts,
+        "slo-loop": cmd_slo_loop,
         "parity-history": cmd_parity_history,
         "audit-trail": cmd_audit_trail,
     }

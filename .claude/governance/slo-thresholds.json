@@ -1,0 +1,13 @@
+{
+  "cooldown_seconds": 900,
+  "ack_latency_p95_warn_seconds": 900,
+  "ack_latency_p95_crit_seconds": 3600,
+  "recovery_time_warn_seconds": 1800,
+  "recovery_time_crit_seconds": 7200,
+  "task_completion_warn_seconds": 21600,
+  "task_completion_crit_seconds": 86400,
+  "restart_rate_24h_warn": 3,
+  "restart_rate_24h_crit": 6,
+  "failure_rate_24h_warn": 3,
+  "failure_rate_24h_crit": 6
+}

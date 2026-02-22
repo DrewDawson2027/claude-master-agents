@@ -6,7 +6,9 @@ python3 ~/.claude/scripts/pin_mcp_npx_versions.py --write
 python3 ~/.claude/scripts/snapshot_lock.py
 python3 ~/.claude/scripts/set_plugin_profile.py core-low-cost
 python3 ~/.claude/scripts/trust_audit.py --quiet
+python3 ~/.claude/scripts/policy_engine.py validate --json >/tmp/policy-validate-weekly.json || true
 python3 ~/.claude/scripts/cost_runtime.py index-refresh || true
+python3 ~/.claude/scripts/observability.py alerts evaluate --no-deliver --json >/tmp/observability-alerts-weekly.json || true
 
 # Team runtime weekly recover-hard sweep (non-fatal; produces a report).
 mkdir -p ~/.claude/reports
@@ -111,6 +113,32 @@ PY
   echo
   echo '```'
   tail -80 /tmp/team-hook-watchdog-weekly.out 2>/dev/null || true
+  echo '```'
+  echo
+
+  echo "### Policy Validate"
+  echo
+  if python3 ~/.claude/scripts/policy_engine.py validate --json > /tmp/policy-validate-weekly.out 2>&1; then
+    echo "- Status: PASS"
+  else
+    echo "- Status: FAIL (continuing)"
+  fi
+  echo
+  echo '```'
+  tail -80 /tmp/policy-validate-weekly.out 2>/dev/null || true
+  echo '```'
+  echo
+
+  echo "### Observability Alerts (Evaluate, no-deliver)"
+  echo
+  if python3 ~/.claude/scripts/observability.py alerts evaluate --no-deliver --json > /tmp/observability-alerts-weekly.out 2>&1; then
+    echo "- Status: PASS"
+  else
+    echo "- Status: FAIL (continuing)"
+  fi
+  echo
+  echo '```'
+  tail -80 /tmp/observability-alerts-weekly.out 2>/dev/null || true
   echo '```'
   echo
 } >> "$WEEKLY_TEAM_REPORT"
