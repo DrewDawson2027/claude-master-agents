@@ -172,7 +172,7 @@ If an agent IS needed, use these. But exhaust direct tools first.
 - **Memory:** `/claude-mem:mem-search`, `/claude-mem:make-plan`, `/claude-mem:do`
 - **Notion:** `/Notion:search`, `/Notion:create-task`, `/Notion:database-query`
 - **Figma:** `/figma:implement-design`, `/figma:code-connect-components`
-- **Design:** `/design-principles`, `/atlas-mastery`
+- **Design:** `/design-principles`
 
 ---
 
@@ -182,22 +182,6 @@ When user corrects me or I make a mistake:
 1. Fix the issue
 2. SILENTLY update: universal → edit this CLAUDE.md, project-specific → `memory/learned-patterns.md`
 3. No permission needed. No announcement.
-
----
-
-## Atlas-Specific Shortcuts
-
-| Looking for | Location |
-|------------|----------|
-| Scrapers | `atlas/scrapers/` |
-| Analytics | `atlas/analytics/` |
-| Models | `atlas/models/` |
-| Framework docs | `atlas/docs/frameworks/` |
-| Player data | `atlas/data/players/` |
-| Run scraper | `python -m atlas.scrapers.<name>` |
-| Run analysis | `python -m atlas.analytics.<name>` |
-
----
 
 ---
 
@@ -222,13 +206,32 @@ Key: `/gsd:progress`, `/gsd:execute-plan`, `/gsd:verify-work`. Never say "done" 
 
 ---
 
+
+## Governance & Maintenance
+
+- **Trust policy:** `~/.claude/governance/TRUST_TIERS.md`
+  - Tier 0: custom core
+  - Tier 1: official Anthropic plugins
+  - Tier 2: community plugins (approval + pin + smoke test)
+- **Default plugin profile:** `core-low-cost`
+  - Apply: `python3 ~/.claude/scripts/set_plugin_profile.py core-low-cost`
+- **Official update channel:** `python3 ~/.claude/scripts/sync_marketplaces.py`
+- **Weekly maintenance:** `~/.claude/scripts/weekly_maintenance.sh`
+  - LaunchAgent: `com.drewdawson.claude.weekly-maintenance`
+- **Monthly dead-capability review:** `~/.claude/scripts/monthly_purge.sh`
+  - LaunchAgent: `com.drewdawson.claude.monthly-purge`
+- **Lock snapshots:** `python3 ~/.claude/scripts/snapshot_lock.py`
+  - Current lock: `~/.claude/locks/current-lock.json`
+- **Niche capability search:** `python3 ~/.claude/scripts/plugin_catalog_search.py <keyword>`
+
+
 ## Agent Architecture
 
-**4 master agents** consolidate 17 archived specialists. Each has on-demand mode loading + MCP tool access:
+**4 master agents** consolidate 15 archived specialists. Each has on-demand mode loading + MCP tool access:
 
 | Agent | Consolidates | Modes | Ref Cards | MCP Tools |
 |-------|-------------|-------|-----------|-----------|
-| master-coder | vibe-coder, auto-validator, atlas-builder, scrape-researcher, school-helper | 5 | 14 | serena, typescript-lsp, pyright-lsp, context7, greptile |
+| master-coder | vibe-coder, auto-validator, scrape-researcher, school-helper | 4 | 14 | serena, typescript-lsp, pyright-lsp, context7, greptile |
 | master-researcher | deep-researcher, ssrn-researcher, competitor-tracker, sentiment-aggregator, gtm-strategist | 4 | 2 | context7, greptile, patent-search, claude-mem |
 | master-architect | mastermind-architect | 4 | 2 | context7, serena, greptile |
 | master-workflow | meta-agent, research-orchestrator, daily-suggestions | 4 | 0 | github, claude-mem |

@@ -3,23 +3,41 @@ set -euo pipefail
 
 CLAUDE_HOME="${HOME}/.claude"
 SCRIPTS="${CLAUDE_HOME}/scripts"
+DIST="${CLAUDE_HOME}/distribution"
+MANIFEST="${DIST}/manifest.json"
 
 usage() {
   cat <<'EOF'
 claude-stack <command>
 
 Commands:
-  doctor   Run local diagnostics and smoke checks
-  install  Apply low-cost profile + trust/cost/parity setup
-  update   Run weekly maintenance (marketplaces, pins, locks, trust, team sweeps, digest)
+  doctor      Run local diagnostics and smoke checks
+  install     Apply low-cost profile + trust/cost/parity setup
+  update      Run weekly maintenance (marketplaces, pins, locks, trust, team sweeps, digest)
+  bootstrap   Full first-time setup: install + verify + onboarding
+  repair      Run self-heal + policy lint + parity audit
+  version     Show installed version from manifest
+  upgrade     Apply a release bundle (tar.gz path)
+  migrate     Run any needed config migrations
+  status      Quick health summary (runtime + cost + policy)
 EOF
 }
 
 cmd_doctor() {
+  echo "=== Trust Audit ==="
   python3 "$SCRIPTS/trust_audit.py"
+  echo ""
+  echo "=== Cost Doctor ==="
   python3 "$SCRIPTS/cost_doctor.py"
+  echo ""
+  echo "=== Cost Index ==="
   python3 "$SCRIPTS/cost_runtime.py" index-refresh || true
+  echo ""
+  echo "=== Parity Smoke ==="
   bash "$SCRIPTS/parity_smoke.sh"
+  echo ""
+  echo "=== Policy Lint ==="
+  python3 "$SCRIPTS/policy_engine.py" lint || true
 }
 
 cmd_install() {
@@ -34,10 +52,176 @@ cmd_update() {
   bash "$SCRIPTS/weekly_maintenance.sh"
 }
 
+cmd_bootstrap() {
+  echo "=== Claude Stack Bootstrap ==="
+  echo ""
+
+  # 1. Check prerequisites
+  echo "--- Checking prerequisites ---"
+  local py_version
+  py_version=$(python3 --version 2>&1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
+  echo "Python: $py_version"
+
+  local node_version
+  node_version=$(node --version 2>&1 || echo "not found")
+  echo "Node: $node_version"
+
+  local claude_version
+  claude_version=$(claude --version 2>&1 || echo "not found")
+  echo "Claude CLI: $claude_version"
+
+  local tmux_version
+  tmux_version=$(tmux -V 2>&1 || echo "not found")
+  echo "tmux: $tmux_version"
+  echo ""
+
+  # 2. Run install
+  echo "--- Running install ---"
+  cmd_install
+  echo ""
+
+  # 3. Policy lint
+  echo "--- Policy lint ---"
+  python3 "$SCRIPTS/policy_engine.py" lint || true
+  echo ""
+
+  # 4. Parity audit
+  echo "--- Parity audit ---"
+  python3 "$SCRIPTS/parity_audit.py" || true
+  echo ""
+
+  # 5. Smoke test team runtime
+  echo "--- Team runtime smoke test ---"
+  python3 "$SCRIPTS/team_runtime.py" team list 2>/dev/null || echo "Team runtime: OK (no teams)"
+  echo ""
+
+  # 6. Record SLO baseline
+  echo "--- Recording SLO baseline ---"
+  python3 "$SCRIPTS/observability.py" slo 2>/dev/null || true
+  echo ""
+
+  echo "=== Bootstrap complete ==="
+  echo "Run 'claude-stack status' for a quick health check."
+  echo "Run 'claude-stack doctor' for full diagnostics."
+}
+
+cmd_repair() {
+  echo "=== Repair ==="
+  echo ""
+  echo "--- Self-heal ---"
+  python3 "$CLAUDE_HOME/hooks/self-heal.py" || true
+  echo ""
+  echo "--- Policy lint ---"
+  python3 "$SCRIPTS/policy_engine.py" lint || true
+  echo ""
+  echo "--- Parity audit ---"
+  python3 "$SCRIPTS/parity_audit.py" || true
+  echo ""
+  echo "--- Cost index refresh ---"
+  python3 "$SCRIPTS/cost_runtime.py" index-refresh || true
+  echo ""
+  echo "=== Repair complete ==="
+}
+
+cmd_version() {
+  if [[ -f "$MANIFEST" ]]; then
+    local version
+    version=$(python3 -c "import json; print(json.load(open('$MANIFEST'))['version'])" 2>/dev/null || echo "unknown")
+    echo "claude-parity-layer v${version}"
+  else
+    echo "No manifest found. Version unknown."
+  fi
+}
+
+cmd_upgrade() {
+  local bundle="${2:-}"
+  if [[ -z "$bundle" ]]; then
+    echo "Usage: claude-stack upgrade <bundle.tar.gz>" >&2
+    exit 1
+  fi
+  if [[ ! -f "$bundle" ]]; then
+    echo "Bundle not found: $bundle" >&2
+    exit 1
+  fi
+
+  echo "=== Verifying bundle ==="
+  python3 "$SCRIPTS/release.py" verify-bundle "$bundle"
+  local rc=$?
+  if [[ $rc -ne 0 ]]; then
+    echo "Bundle verification failed. Aborting upgrade." >&2
+    exit 1
+  fi
+
+  echo ""
+  echo "=== Extracting bundle to $CLAUDE_HOME ==="
+  tar -xzf "$bundle" -C "$CLAUDE_HOME"
+  echo "Bundle extracted."
+
+  echo ""
+  echo "=== Running post-upgrade repair ==="
+  cmd_repair
+
+  echo ""
+  echo "=== Upgrade complete ==="
+  cmd_version
+}
+
+cmd_migrate() {
+  echo "=== Config Migration ==="
+
+  # Ensure new directories exist
+  mkdir -p "$CLAUDE_HOME/governance/team-policies"
+  mkdir -p "$CLAUDE_HOME/distribution/releases"
+  mkdir -p "$CLAUDE_HOME/reports"
+
+  # Ensure governance files exist with defaults
+  if [[ ! -f "$CLAUDE_HOME/governance/tier2-approvals.json" ]]; then
+    echo '{"approved": []}' > "$CLAUDE_HOME/governance/tier2-approvals.json"
+    echo "Created default tier2-approvals.json"
+  fi
+
+  if [[ ! -f "$CLAUDE_HOME/governance/marketplace-channels.json" ]]; then
+    echo '{"channels": []}' > "$CLAUDE_HOME/governance/marketplace-channels.json"
+    echo "Created default marketplace-channels.json"
+  fi
+
+  echo "Migration complete."
+}
+
+cmd_status() {
+  echo "=== Claude Stack Status ==="
+  cmd_version
+  echo ""
+
+  echo "--- Runtime ---"
+  python3 "$SCRIPTS/team_runtime.py" team list 2>/dev/null || echo "No teams"
+  echo ""
+
+  echo "--- Cost (today) ---"
+  python3 "$SCRIPTS/cost_runtime.py" summary --window today 2>/dev/null || echo "No cost data"
+  echo ""
+
+  echo "--- Policy ---"
+  python3 "$SCRIPTS/policy_engine.py" lint --json 2>/dev/null | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print(f\"Policy: {d['status']} ({d['ok']}/{d['total']})\")
+except:
+    print('Policy: unknown')
+" 2>/dev/null || echo "Policy: unknown"
+}
+
 case "${1:-}" in
   doctor) cmd_doctor ;;
   install) cmd_install ;;
   update) cmd_update ;;
+  bootstrap) cmd_bootstrap ;;
+  repair) cmd_repair ;;
+  version) cmd_version ;;
+  upgrade) cmd_upgrade "$@" ;;
+  migrate) cmd_migrate ;;
+  status) cmd_status ;;
   ""|-h|--help|help) usage ;;
   *) echo "Unknown command: $1" >&2; usage; exit 2 ;;
 esac

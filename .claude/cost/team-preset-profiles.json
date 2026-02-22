@@ -24,5 +24,15 @@
         }
       ]
     }
+  },
+  "modelPolicy": {
+    "cost-optimized": {"default": "haiku", "coder": "sonnet", "lead": "sonnet"},
+    "balanced": {"default": "sonnet", "coder": "sonnet", "lead": "sonnet"},
+    "capability-first": {"default": "sonnet", "coder": "opus", "lead": "opus"}
+  },
+  "presetModelMapping": {
+    "lite": "cost-optimized",
+    "standard": "balanced",
+    "heavy": "capability-first"
   }
 }

@@ -25,7 +25,6 @@ Registry of all modes, reference cards, keywords, and purposes. Source of truth 
 | Debug | `debug-mode.md` | fix, broken, error, debug, failing, bug | 113 | Systematic root cause analysis |
 | Review | `review-mode.md` | review, check, audit, PR, code quality | 131 | Code review + security audit |
 | Refactor | `refactor-mode.md` | simplify, refactor, clean up, reduce | 79 | Code simplification |
-| Atlas | `atlas-mode.md` | atlas, Atlas, atlas-betting | 91 | Atlas platform domain knowledge |
 
 ### master-researcher modes (`~/.claude/master-agents/researcher/`)
 
@@ -118,6 +117,91 @@ Registry of all modes, reference cards, keywords, and purposes. Source of truth 
 
 Metrics log: `~/.claude/hooks/session-state/agent-metrics.jsonl`
 Compaction log: `~/.claude/session-cache/compaction-log.jsonl`
+
+---
+
+## Phase F: Observability + Governance Scripts
+
+| Script | Purpose | Subcommands |
+|--------|---------|-------------|
+| `~/.claude/scripts/observability.py` | Unified observability suite | `health-report`, `timeline`, `slo`, `parity-history`, `audit-trail` |
+| `~/.claude/scripts/policy_engine.py` | Governance policy engine | `lint`, `check-action`, `check-tools`, `redact`, `sign`, `verify` |
+| `~/.claude/scripts/release.py` | Release management | `bundle`, `changelog`, `verify-bundle` |
+
+### Observability MCP Tools
+
+| Tool | Description |
+|------|-------------|
+| `coord_obs_health_report` | Unified health dashboard |
+| `coord_obs_timeline` | Chronological team timeline |
+| `coord_obs_slo` | SLO metrics report |
+| `coord_obs_slo_snapshot` | Record SLO metrics snapshot |
+| `coord_obs_parity_history` | Parity grade trend |
+| `coord_obs_audit_trail` | Audit trail of sensitive ops |
+
+### Policy MCP Tools
+
+| Tool | Description |
+|------|-------------|
+| `coord_policy_lint` | Validate governance configs |
+| `coord_policy_check_action` | Action approval gate |
+| `coord_policy_check_tools` | Tool/model restriction check |
+| `coord_policy_redact` | Path/secret redaction |
+| `coord_policy_sign` | SHA-256 file signing |
+| `coord_policy_verify` | Signature verification |
+
+### Phase G: Distribution
+
+| File | Purpose |
+|------|---------|
+| `~/.claude/distribution/manifest.json` | Bundle component manifest |
+| `~/.claude/distribution/compatibility.md` | Platform/version compatibility matrix |
+| `~/.claude/scripts/claude-stack` | Lifecycle CLI: doctor, install, update, bootstrap, repair, version, upgrade, migrate, status |
+
+---
+
+## Phase I: Multi-Human Collaboration + Smart Automation
+
+### Collaboration Scripts
+
+| Script | Purpose | Subcommands |
+|--------|---------|-------------|
+| `~/.claude/scripts/collaboration.py` | Multi-human collaboration | `set-role`, `check-permission`, `handoff-create`, `handoff-latest`, `set-ownership`, `get-ownership`, `set-presence`, `who`, `comment`, `comments` |
+| `~/.claude/scripts/smart_automation.py` | Smart automation loops | `recommend-preset`, `decompose`, `auto-recover`, `auto-scale`, `weekly-optimize` |
+
+### Collaboration MCP Tools
+
+| Tool | Description |
+|------|-------------|
+| `coord_collab_set_role` | Set operator role (lead/operator/viewer) |
+| `coord_collab_check_permission` | Check action permissions by role |
+| `coord_collab_handoff_create` | Create handoff snapshot |
+| `coord_collab_handoff_latest` | View changes since last handoff |
+| `coord_collab_set_ownership` | Set team ownership metadata |
+| `coord_collab_set_presence` | Set operator availability |
+| `coord_collab_who` | List operators with presence/roles |
+| `coord_collab_comment` | Add annotation to task/event/message |
+| `coord_collab_comments` | List annotations |
+
+### Automation MCP Tools
+
+| Tool | Description |
+|------|-------------|
+| `coord_auto_recommend_preset` | Recommend preset by budget/repo/task |
+| `coord_auto_decompose` | Decompose goal into task graph |
+| `coord_auto_recover` | Auto-recover: doctor + SLO + recover-hard |
+| `coord_auto_scale` | Auto-scale by queue depth + budget |
+| `coord_auto_weekly_optimize` | Weekly optimization recommendations |
+
+### Production Documentation
+
+| File | Purpose |
+|------|---------|
+| `~/.claude/docs/operator-manual.md` | One-page operator reference |
+| `~/.claude/docs/incident-runbooks.md` | Structured incident response |
+| `~/.claude/docs/architecture.md` | Mermaid system diagram |
+| `~/.claude/docs/config-reference.md` | All config file schemas |
+| `~/.claude/docs/troubleshooting.md` | Symptom → fix matrix |
 
 ---
 

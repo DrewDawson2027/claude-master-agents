@@ -744,10 +744,35 @@ def _preset_from_budget_pct(pct: float | None, *, no_budget_preset: str = 'stand
     return 'lite'
 
 
+def _compute_recommendation_confidence(today_res: dict, cache_doc: dict | None = None) -> float:
+    """Compute confidence score 0.0-1.0 for budget recommendation."""
+    score = 0.5  # baseline
+    totals = today_res.get('totals', {})
+    messages = totals.get('messages', 0)
+    if messages >= 50:
+        score += 0.2
+    elif messages >= 10:
+        score += 0.1
+    source = today_res.get('source', '')
+    if 'hybrid' in str(source):
+        score += 0.2
+    elif 'local' in str(source):
+        score += 0.05
+    if cache_doc:
+        gen = cache_doc.get('generatedAt', '')
+        if gen:
+            try:
+                from datetime import datetime, timezone
+                age_sec = (datetime.now(timezone.utc) - datetime.fromisoformat(gen.replace('Z', '+00:00'))).total_seconds()
+                if age_sec < 300:
+                    score += 0.1
+            except Exception:
+                pass
+    return min(1.0, round(score, 2))
+
+
 def cmd_team_budget_recommend(args: argparse.Namespace) -> int:
-    # Ensure index exists to speed repeated calls.
     refresh_usage_index_cache(force=False)
-    # Budget recommendation should usually use global daily burn unless team budget is set.
     team_id = args.team_id
     bdoc = budgets()
     team_has_budget = bool(team_id and (((bdoc.get('teams') or {}).get(team_id) or {}).get('dailyUSD')))
@@ -762,6 +787,22 @@ def cmd_team_budget_recommend(args: argparse.Namespace) -> int:
     if proj is not None and lim:
         if float(proj) >= float(lim):
             burn_alert = f"Projected daily burn {proj:.2f} exceeds cap {float(lim):.2f}"
+    # Confidence scoring
+    cache_doc = read_json(CACHE_FILE, None)
+    confidence = _compute_recommendation_confidence(today, cache_doc)
+    # Alternatives with rationale
+    hourly = projection.get('hourlyUSD')
+    alternatives = []
+    for p_name, desc in [('lite', 'Minimal parallelism, lowest cost'), ('standard', 'Balanced parallelism and cost'), ('heavy', 'Maximum parallelism, highest cost')]:
+        mult = {'lite': 0.5, 'standard': 1.0, 'heavy': 2.0}[p_name]
+        est_daily = round(float(hourly or 0) * 24.0 * mult, 2) if hourly else None
+        alternatives.append({'preset': p_name, 'reason': desc, 'estimatedDailyUSD': est_daily})
+    # Rationale
+    pct = budget.get('pct')
+    if pct is not None:
+        rationale = f"At {pct:.1f}% of daily budget ({format_money(budget.get('currentUSD'))} / {format_money(lim)}), '{preset}' optimizes cost vs productivity."
+    else:
+        rationale = "No budget configured. Defaulting to standard preset."
     out = {
         'generatedAt': utc_now(),
         'team_id': team_id,
@@ -771,21 +812,288 @@ def cmd_team_budget_recommend(args: argparse.Namespace) -> int:
         'budget': budget,
         'projection': projection,
         'recommendedPreset': preset,
-        'reason': 'budget_pct' if budget.get('pct') is not None else 'no_budget_configured',
+        'reason': 'budget_pct' if pct is not None else 'no_budget_configured',
         'burnRateAlert': burn_alert,
+        'confidence': confidence,
+        'alternatives': alternatives,
+        'rationale': rationale,
     }
     if args.json:
         print(json.dumps(out, indent=2))
     else:
         print(
-            f"Recommended preset: {preset}\n"
+            f"Recommended preset: {preset} (confidence: {confidence})\n"
+            f"- Rationale: {rationale}\n"
             f"- Scope: {out.get('scope')} period={out.get('period')}\n"
-            f"- Budget pct: {budget.get('pct')}\n"
+            f"- Budget pct: {pct}\n"
             f"- Today's cost: {projection.get('todayUSD')}\n"
             f"- Active-block hourly burn: {projection.get('hourlyUSD')}\n"
             f"- Projected daily burn: {projection.get('projectedDailyUSD')}\n"
-            f"- Alert: {burn_alert or 'none'}"
+            f"- Alert: {burn_alert or 'none'}\n"
+            f"- Alternatives: {', '.join(a['preset'] + '(~' + format_money(a.get('estimatedDailyUSD')) + '/d)' for a in alternatives)}"
         )
+    return 0
+
+
+def cmd_burn_rate_check(args: argparse.Namespace) -> int:
+    refresh_usage_index_cache(force=False)
+    team_id = getattr(args, 'team_id', None)
+    project = getattr(args, 'project', None)
+    today = summarize('today', None, None, team_id, None, project, None, False)
+    active_block = summarize('active_block', None, None, team_id, None, project, None, False, use_index=False)
+    projection = _burn_rate_projection(today, active_block)
+    budget = today.get('budget') or {}
+    limit_usd = budget.get('limitUSD')
+    proj_daily = projection.get('projectedDailyUSD')
+    alert = False
+    message = 'No alert'
+    hours_to_exhaustion = None
+    if proj_daily is not None and limit_usd and float(limit_usd) > 0:
+        current = budget.get('currentUSD') or 0
+        remaining = float(limit_usd) - float(current)
+        hourly = projection.get('hourlyUSD')
+        if hourly and float(hourly) > 0:
+            hours_to_exhaustion = round(remaining / float(hourly), 1)
+        if float(proj_daily) >= float(limit_usd):
+            alert = True
+            message = f"Budget exceeded in {hours_to_exhaustion or '?'}h at current rate (${proj_daily:.2f}/day vs ${float(limit_usd):.2f} cap)"
+    out = {
+        'alert': alert,
+        'message': message,
+        'projectedDailyUSD': proj_daily,
+        'limitUSD': limit_usd,
+        'currentUSD': budget.get('currentUSD'),
+        'hoursToExhaustion': hours_to_exhaustion,
+        'hourlyBurnUSD': projection.get('hourlyUSD'),
+        'scope': budget.get('scope'),
+    }
+    if getattr(args, 'json', False):
+        print(json.dumps(out, indent=2))
+    else:
+        print(f"Burn-rate: {'ALERT' if alert else 'OK'} — {message}")
+        if hours_to_exhaustion is not None:
+            print(f"Hours to exhaustion: {hours_to_exhaustion}h")
+    return 0
+
+
+def cmd_anomaly_check(args: argparse.Namespace) -> int:
+    team_id = getattr(args, 'team_id', None)
+    sensitivity = float(getattr(args, 'sensitivity', None) or 2.0)
+    # Build baseline from cached daily summaries
+    idx = load_usage_index()
+    windows = idx.get('windows', {})
+    baselines: list[dict] = []
+    for key in ['today', 'week', 'month']:
+        entry = windows.get(key)
+        if isinstance(entry, dict) and entry.get('totals'):
+            baselines.append(entry)
+    if not baselines:
+        out = {'anomalies': [], 'message': 'Insufficient baseline data for anomaly detection'}
+        if getattr(args, 'json', False):
+            print(json.dumps(out, indent=2))
+        else:
+            print(out['message'])
+        return 0
+    # Current session metrics
+    current = summarize('active_block', None, None, team_id, None, None, None, False, use_index=False)
+    ct = current.get('totals', {})
+    # Baseline averages from weekly data (divide by 7 for daily, by 24 for hourly)
+    week_entry = windows.get('week')
+    baseline_totals = (week_entry or {}).get('totals', {}) if week_entry else {}
+    avg_daily_msgs = (baseline_totals.get('messages', 0) or 0) / 7.0
+    avg_daily_tokens = ((baseline_totals.get('inputTokens', 0) or 0) + (baseline_totals.get('outputTokens', 0) or 0)) / 7.0
+    avg_daily_cost = (baseline_totals.get('totalUSD') or baseline_totals.get('localCostUSD') or 0) / 7.0
+    # Current daily rates (from today's data)
+    today_entry = windows.get('today', {})
+    today_totals = (today_entry or {}).get('totals', {}) if today_entry else ct
+    cur_msgs = today_totals.get('messages', 0) or 0
+    cur_tokens = (today_totals.get('inputTokens', 0) or 0) + (today_totals.get('outputTokens', 0) or 0)
+    cur_cost = today_totals.get('totalUSD') or today_totals.get('localCostUSD') or 0
+    anomalies = []
+    if avg_daily_msgs > 0 and cur_msgs > sensitivity * avg_daily_msgs:
+        anomalies.append({'type': 'message_volume_spike', 'current': cur_msgs, 'baseline': round(avg_daily_msgs, 1), 'ratio': round(cur_msgs / avg_daily_msgs, 2)})
+    if avg_daily_tokens > 0 and cur_tokens > sensitivity * avg_daily_tokens:
+        anomalies.append({'type': 'token_usage_spike', 'current': cur_tokens, 'baseline': round(avg_daily_tokens, 1), 'ratio': round(cur_tokens / avg_daily_tokens, 2)})
+    if avg_daily_cost > 0 and float(cur_cost) > sensitivity * avg_daily_cost:
+        anomalies.append({'type': 'cost_delta_spike', 'currentUSD': float(cur_cost), 'baselineUSD': round(avg_daily_cost, 2), 'ratio': round(float(cur_cost) / avg_daily_cost, 2)})
+    out = {
+        'anomalies': anomalies,
+        'anomalyCount': len(anomalies),
+        'sensitivity': sensitivity,
+        'baseline': {'dailyMessages': round(avg_daily_msgs, 1), 'dailyTokens': round(avg_daily_tokens), 'dailyCostUSD': round(avg_daily_cost, 2)},
+        'current': {'messages': cur_msgs, 'tokens': cur_tokens, 'costUSD': float(cur_cost)},
+    }
+    if getattr(args, 'json', False):
+        print(json.dumps(out, indent=2))
+    else:
+        if anomalies:
+            print(f"ANOMALIES DETECTED ({len(anomalies)}):")
+            for a in anomalies:
+                print(f"  - {a['type']}: {a.get('ratio', '?')}x baseline")
+        else:
+            print("No anomalies detected.")
+    return 0
+
+
+def cmd_spend_leaderboard(args: argparse.Namespace) -> int:
+    window = getattr(args, 'window', 'today') or 'today'
+    group_by = getattr(args, 'group_by', 'session') or 'session'
+    limit = int(getattr(args, 'limit', None) or 10)
+    res = summarize(window, None, None, None, None, None, None, True)
+    local = res.get('local', {})
+    entries: list[dict] = []
+    if group_by == 'session':
+        for sid, v in (local.get('sessions', {}) or {}).items():
+            entries.append({'id': sid, 'group': 'session', 'messages': v.get('messages', 0), 'inputTokens': v.get('inputTokens', 0), 'outputTokens': v.get('outputTokens', 0), 'costUSD': v.get('localCostUSD') or 0})
+    elif group_by == 'team':
+        for tid, v in (local.get('teams', {}) or {}).items():
+            entries.append({'id': tid, 'group': 'team', 'messages': v.get('messages', 0), 'inputTokens': v.get('inputTokens', 0), 'outputTokens': v.get('outputTokens', 0), 'costUSD': v.get('localCostUSD') or 0})
+    elif group_by == 'model':
+        models: dict[str, dict] = {}
+        for sid, v in (local.get('sessions', {}) or {}).items():
+            model = v.get('model', 'unknown')
+            if model not in models:
+                models[model] = {'messages': 0, 'inputTokens': 0, 'outputTokens': 0, 'costUSD': 0}
+            models[model]['messages'] += v.get('messages', 0)
+            models[model]['inputTokens'] += v.get('inputTokens', 0)
+            models[model]['outputTokens'] += v.get('outputTokens', 0)
+            models[model]['costUSD'] += v.get('localCostUSD') or 0
+        for mid, v in models.items():
+            entries.append({'id': mid, 'group': 'model', **v})
+    entries.sort(key=lambda x: float(x.get('costUSD') or 0), reverse=True)
+    total_cost = sum(float(e.get('costUSD') or 0) for e in entries)
+    for e in entries:
+        e['pctOfTotal'] = round((float(e.get('costUSD') or 0) / total_cost * 100) if total_cost > 0 else 0, 1)
+    entries = entries[:limit]
+    out = {'window': window, 'groupBy': group_by, 'totalCostUSD': round(total_cost, 4), 'entries': entries}
+    if getattr(args, 'json', False):
+        print(json.dumps(out, indent=2))
+    else:
+        print(f"Spend Leaderboard ({window}, by {group_by}):")
+        print(f"Total: {format_money(total_cost)}")
+        for i, e in enumerate(entries, 1):
+            print(f"  {i}. {e['id']}: {format_money(e.get('costUSD'))} ({e['pctOfTotal']}%) msgs={e['messages']} tokens={e['inputTokens']+e['outputTokens']:,}")
+    return 0
+
+
+def cmd_daily_report(args: argparse.Namespace) -> int:
+    from datetime import datetime
+    team_id = getattr(args, 'team_id', None)
+    window = getattr(args, 'window', 'today') or 'today'
+    res = summarize(window, None, None, team_id, None, None, None, True)
+    budget = res.get('budget', {})
+    active_block = summarize('active_block', None, None, team_id, None, None, None, False, use_index=False)
+    projection = _burn_rate_projection(res, active_block)
+    # Anomaly check inline
+    idx = load_usage_index()
+    week_entry = (idx.get('windows', {}) or {}).get('week', {})
+    bt = (week_entry or {}).get('totals', {})
+    avg_daily_cost = (bt.get('totalUSD') or bt.get('localCostUSD') or 0) / 7.0
+    cur_cost = (res.get('totals', {}).get('totalUSD') or res.get('totals', {}).get('localCostUSD') or 0)
+    anomaly_flag = float(cur_cost) > 2.0 * avg_daily_cost if avg_daily_cost > 0 else False
+    # Build report
+    ts = datetime.now().strftime('%Y%m%d')
+    totals = res.get('totals', {})
+    lines = [
+        f"# Daily Cost Report — {ts}",
+        "",
+        "## Summary",
+        f"- Window: {window}",
+        f"- Total Cost: {format_money(totals.get('totalUSD'))} (local: {format_money(totals.get('localCostUSD'))})",
+        f"- Tokens: in={totals.get('inputTokens',0):,} out={totals.get('outputTokens',0):,}",
+        f"- Messages: {totals.get('messages',0):,}",
+        "",
+        "## Budget Status",
+        f"- Scope: {budget.get('scope')} | Period: {budget.get('period')}",
+        f"- Current: {format_money(budget.get('currentUSD'))} / {format_money(budget.get('limitUSD'))}",
+        f"- Level: {budget.get('level')} ({budget.get('pct')}%)",
+        "",
+        "## Burn-Rate Projection",
+        f"- Hourly burn: {format_money(projection.get('hourlyUSD'))}",
+        f"- Projected daily: {format_money(projection.get('projectedDailyUSD'))}",
+    ]
+    if projection.get('projectedDailyUSD') and budget.get('limitUSD'):
+        remaining = float(budget['limitUSD']) - float(budget.get('currentUSD') or 0)
+        hourly = projection.get('hourlyUSD')
+        if hourly and float(hourly) > 0:
+            lines.append(f"- Hours to exhaustion: {round(remaining / float(hourly), 1)}h")
+    lines += ["", "## Anomalies"]
+    if anomaly_flag:
+        lines.append(f"- COST SPIKE: today ({format_money(cur_cost)}) > 2x weekly avg ({format_money(avg_daily_cost)})")
+    else:
+        lines.append("- None detected")
+    # Top spenders
+    local = res.get('local', {})
+    sessions = local.get('sessions', {}) or {}
+    sorted_sessions = sorted(sessions.items(), key=lambda x: float(x[1].get('localCostUSD') or 0), reverse=True)[:5]
+    lines += ["", "## Top Sessions"]
+    for sid, v in sorted_sessions:
+        lines.append(f"- {sid}: {format_money(v.get('localCostUSD'))} ({v.get('messages',0)} msgs)")
+    # Recommendations
+    lines += ["", "## Recommendations"]
+    if budget.get('level') == 'critical':
+        lines.append("- CRITICAL: Consider scaling teams to lite preset")
+    elif budget.get('level') == 'warning':
+        lines.append("- WARNING: Monitor burn rate, consider downshifting if spend continues")
+    elif anomaly_flag:
+        lines.append("- Investigate cost spike — check for runaway sessions")
+    else:
+        lines.append("- Budget healthy. No action needed.")
+    report = '\n'.join(lines)
+    out_path = REPORTS_DIR / f"cost-daily-{ts}.md"
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(report + '\n')
+    if getattr(args, 'json', False):
+        print(json.dumps({'path': str(out_path), 'anomaly': anomaly_flag, 'budgetLevel': budget.get('level')}, indent=2))
+    else:
+        print(f"Daily report written: {out_path}")
+        print(report)
+    return 0
+
+
+def cmd_cost_trends(args: argparse.Namespace) -> int:
+    period = getattr(args, 'period', 'week') or 'week'
+    fmt = getattr(args, 'format', 'md') or 'md'
+    idx = load_usage_index()
+    windows = idx.get('windows', {})
+    # Build data series from available windows
+    series: list[dict] = []
+    for key in ['today', 'week', 'month']:
+        entry = windows.get(key)
+        if isinstance(entry, dict) and entry.get('totals'):
+            t = entry['totals']
+            series.append({
+                'window': key,
+                'costUSD': t.get('totalUSD') or t.get('localCostUSD') or 0,
+                'messages': t.get('messages', 0),
+                'inputTokens': t.get('inputTokens', 0),
+                'outputTokens': t.get('outputTokens', 0),
+            })
+    if not series:
+        print("No trend data available. Run index-refresh first.")
+        return 1
+    # Compute daily averages
+    for s in series:
+        divisor = {'today': 1, 'week': 7, 'month': 30}.get(s['window'], 1)
+        s['dailyAvgCostUSD'] = round(float(s['costUSD']) / divisor, 2)
+        s['dailyAvgMessages'] = round(s['messages'] / divisor, 1)
+    # Week-over-week comparison
+    today_cost = next((s['costUSD'] for s in series if s['window'] == 'today'), None)
+    week_avg = next((s['dailyAvgCostUSD'] for s in series if s['window'] == 'week'), None)
+    wow_change = None
+    if today_cost is not None and week_avg and week_avg > 0:
+        wow_change = round(((float(today_cost) - week_avg) / week_avg) * 100, 1)
+    out = {'period': period, 'series': series, 'weekOverWeekChangePct': wow_change}
+    if fmt == 'json' or getattr(args, 'json', False):
+        print(json.dumps(out, indent=2))
+    else:
+        print("Cost Trends:")
+        print(f"{'Window':<10} {'Cost':>10} {'Daily Avg':>10} {'Messages':>10} {'Tokens':>15}")
+        for s in series:
+            print(f"{s['window']:<10} {format_money(s['costUSD']):>10} {format_money(s['dailyAvgCostUSD']):>10} {s['messages']:>10,} {s['inputTokens']+s['outputTokens']:>15,}")
+        if wow_change is not None:
+            direction = "UP" if wow_change > 0 else "DOWN"
+            print(f"\nWeek-over-week: {direction} {abs(wow_change)}%")
     return 0
 
 
@@ -847,6 +1155,34 @@ def build_parser() -> argparse.ArgumentParser:
     br.add_argument('--team-id')
     br.add_argument('--project')
     br.add_argument('--json', action='store_true')
+
+    brc = sp.add_parser('burn-rate-check')
+    brc.add_argument('--team-id')
+    brc.add_argument('--project')
+    brc.add_argument('--json', action='store_true')
+
+    ac = sp.add_parser('anomaly-check')
+    ac.add_argument('--team-id')
+    ac.add_argument('--sensitivity', type=float, default=2.0)
+    ac.add_argument('--json', action='store_true')
+
+    sl2 = sp.add_parser('spend-leaderboard')
+    sl2.add_argument('--window', choices=['today', 'week', 'month'], default='today')
+    sl2.add_argument('--group-by', choices=['session', 'team', 'model'], default='session')
+    sl2.add_argument('--limit', type=int, default=10)
+    sl2.add_argument('--json', action='store_true')
+
+    dr = sp.add_parser('daily-report')
+    dr.add_argument('--team-id')
+    dr.add_argument('--window', choices=['today', 'week', 'month'], default='today')
+    dr.add_argument('--auto', action='store_true')
+    dr.add_argument('--json', action='store_true')
+
+    ct = sp.add_parser('cost-trends')
+    ct.add_argument('--period', choices=['week', 'month'], default='week')
+    ct.add_argument('--format', choices=['json', 'md'], default='md')
+    ct.add_argument('--json', action='store_true')
+
     return p
 
 
@@ -881,6 +1217,16 @@ def main() -> int:
         return cmd_index_refresh(args)
     if args.cmd == 'team-budget-recommend':
         return cmd_team_budget_recommend(args)
+    if args.cmd == 'burn-rate-check':
+        return cmd_burn_rate_check(args)
+    if args.cmd == 'anomaly-check':
+        return cmd_anomaly_check(args)
+    if args.cmd == 'spend-leaderboard':
+        return cmd_spend_leaderboard(args)
+    if args.cmd == 'daily-report':
+        return cmd_daily_report(args)
+    if args.cmd == 'cost-trends':
+        return cmd_cost_trends(args)
     print('unknown command', file=sys.stderr)
     return 1
 

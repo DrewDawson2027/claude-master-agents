@@ -83,15 +83,8 @@ Report format: `🟢 [COMMENT] file:line — {inaccuracy}. Actual behavior: {tru
 
 Report format: `🟡 [STYLE] file:line — {violation}. Convention: {what adjacent code does}`
 
-### Step 3: Atlas Product Identity Check (if Atlas codebase)
-```bash
-grep -riE '(recommend|strong_over|avoid|you should|edge|probability|ev_calc)' [changed files]
-```
-Must return EMPTY. Any match = automatic REWORK verdict.
-
-### Step 4: Build Verification
-- **Backend**: `cd ~/Desktop/Atlas && python -m pytest tests/ -x -q --tb=line`
-- **Frontend**: `cd ~/atlas-betting && npm run build`
+### Step 3: Build Verification
+- Run project test/build commands that match the changed stack.
 - Pass = continue. Fail = include in findings.
 
 ---
@@ -125,7 +118,6 @@ Must return EMPTY. Any match = automatic REWORK verdict.
 
 **Verdict rules:**
 - Any D1 finding ≥80 confidence → REWORK
-- Any product identity violation → REWORK
 - Build failure → BLOCKED
 - D2-D7 findings only → PASS w/ NOTES
 - Clean → PASS

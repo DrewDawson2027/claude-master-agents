@@ -42,6 +42,39 @@ CLAIM_TTL_SECONDS = 900
 MESSAGE_TTL_SECONDS = 86400
 EVENT_COMPACT_KEEP = 1000
 
+# Phase C: Communication + Task Semantics
+MESSAGE_SLA_THRESHOLDS = {"urgent": 60, "high": 300, "normal": 900, "low": 3600}
+TASK_PRIORITY_ORDER = {"critical": 0, "high": 1, "normal": 2, "low": 3}
+VALID_TASK_PRIORITIES = set(TASK_PRIORITY_ORDER.keys())
+VALID_SLA_CLASSES = {"urgent", "normal", "relaxed"}
+
+TASK_TEMPLATES = {
+    "build-review-test-docs": {
+        "description": "Standard build pipeline: build, review, test, docs",
+        "tasks": [
+            {"suffix": "build", "title": "Build / Implement", "dependsOn": []},
+            {"suffix": "review", "title": "Code Review", "dependsOn": ["build"]},
+            {"suffix": "test", "title": "Test & Validate", "dependsOn": ["review"]},
+            {"suffix": "docs", "title": "Documentation", "dependsOn": ["test"]},
+        ],
+    },
+    "bugfix-hotfix": {
+        "description": "Bug fix pipeline: reproduce, fix, verify",
+        "tasks": [
+            {"suffix": "reproduce", "title": "Reproduce Bug", "dependsOn": []},
+            {"suffix": "fix", "title": "Fix Bug", "dependsOn": ["reproduce"]},
+            {"suffix": "verify", "title": "Verify Fix", "dependsOn": ["fix"]},
+        ],
+    },
+    "research-summary": {
+        "description": "Research pipeline: research, summarize",
+        "tasks": [
+            {"suffix": "research", "title": "Research", "dependsOn": []},
+            {"suffix": "summarize", "title": "Summarize Findings", "dependsOn": ["research"]},
+        ],
+    },
+}
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -127,6 +160,30 @@ def ensure_team_preset_profiles() -> dict[str, Any]:
         write_json(TEAM_PRESET_PROFILE_FILE, default)
         return default
     return cur
+
+
+def _resolve_model_for_member(preset: str, role: str, team_config: dict[str, Any] | None = None) -> str | None:
+    """Resolve model ID from budget-driven model policy. Returns None if no policy applies."""
+    # Check per-team budget policy override first
+    if team_config:
+        policy_name = (team_config.get("budgetPolicy") or {}).get("modelPolicy")
+        if policy_name:
+            profiles = ensure_team_preset_profiles()
+            model_policies = profiles.get("modelPolicy", {})
+            policy = model_policies.get(policy_name, {})
+            if policy:
+                return policy.get(role) or policy.get("default")
+    # Fall back to preset-based model mapping
+    profiles = ensure_team_preset_profiles()
+    mapping = profiles.get("presetModelMapping", {})
+    policy_name = mapping.get(preset)
+    if not policy_name:
+        return None
+    model_policies = profiles.get("modelPolicy", {})
+    policy = model_policies.get(policy_name, {})
+    if not policy:
+        return None
+    return policy.get(role) or policy.get("default")
 
 
 def write_json(path: Path, data: Any) -> None:
@@ -721,8 +778,14 @@ def cmd_teammate_spawn_pane(args: argparse.Namespace) -> str:
     claude_cmd = "claude"
     if args.agent:
         claude_cmd += f" --agent {shlex.quote(args.agent)}"
-    if args.model:
-        claude_cmd += f" --model {shlex.quote(args.model)}"
+    effective_model = args.model
+    if not effective_model:
+        # Resolve model from budget-driven model policy
+        role = args.role or "teammate"
+        preset = getattr(args, "_effective_preset", None) or "standard"
+        effective_model = _resolve_model_for_member(preset, role, cfg)
+    if effective_model:
+        claude_cmd += f" --model {shlex.quote(effective_model)}"
     if args.initial_prompt:
         claude_cmd += f" --prompt {shlex.quote(args.initial_prompt)}"
     shell_cmd_parts.append(claude_cmd)
@@ -872,6 +935,16 @@ def cmd_message_send(args: argparse.Namespace) -> str:
     }
     if getattr(args, "reply_to_message_id", None):
         msg["replyToMessageId"] = safe_id(args.reply_to_message_id, "reply_to_message_id")
+    # Thread correlation: propagate or create threadId
+    thread_id = getattr(args, "thread_id", None)
+    if thread_id:
+        msg["threadId"] = safe_id(thread_id, "thread_id")
+    elif msg.get("replyToMessageId"):
+        # Inherit threadId from the message being replied to
+        parent = latest_messages_by_id(store).get(msg["replyToMessageId"])
+        msg["threadId"] = parent.get("threadId", msg["replyToMessageId"]) if parent else msg["replyToMessageId"]
+    else:
+        msg["threadId"] = message_id  # New thread starts with this message
     delivery = _deliver_to_member_session(store, to, msg)
     msg.update(delivery)
     append_message_ledger(store, msg)
@@ -960,16 +1033,32 @@ def cmd_task_add(args: argparse.Namespace) -> str:
         if unmet:
             raise SystemExit(f"Unknown dependency task(s): {', '.join(unmet)}")
         files = [canonical_path(f) for f in (args.files or [])]
+        priority = getattr(args, "priority", None) or "normal"
+        if priority not in VALID_TASK_PRIORITIES:
+            raise SystemExit(f"Invalid task priority: {priority}. Allowed: {', '.join(sorted(VALID_TASK_PRIORITIES))}")
+        labels = [l.strip() for l in (getattr(args, "labels", None) or []) if l.strip()]
+        estimate_minutes = getattr(args, "estimate_minutes", None)
+        due_at = getattr(args, "due_at", None)
+        sla_class = getattr(args, "sla_class", None)
+        if sla_class and sla_class not in VALID_SLA_CLASSES:
+            raise SystemExit(f"Invalid SLA class: {sla_class}. Allowed: {', '.join(sorted(VALID_SLA_CLASSES))}")
+        approval_required = bool(getattr(args, "approval_required", False))
         task = {
             "taskId": task_id,
             "title": args.title,
             "description": args.description or "",
             "status": "blocked" if deps else "pending",
+            "priority": priority,
             "dependsOn": deps,
             "files": files,
+            "labels": labels,
             "claimedBy": None,
             "claimedAt": None,
             "assignee": args.assignee,
+            "approvalRequired": approval_required,
+            "estimateMinutes": int(estimate_minutes) if estimate_minutes else None,
+            "dueAt": due_at,
+            "slaClass": sla_class,
             "createdAt": utc_now(),
             "updatedAt": utc_now(),
             "history": [{"ts": utc_now(), "action": "created", "by": args.created_by or "lead"}],
@@ -986,12 +1075,18 @@ def cmd_task_list(args: argparse.Namespace) -> str:
     tasks = doc.get("tasks", [])
     if args.status:
         tasks = [t for t in tasks if t.get("status") == args.status]
+    label_filter = getattr(args, "label", None)
+    if label_filter:
+        tasks = [t for t in tasks if label_filter in (t.get("labels") or [])]
     if not tasks:
         return "No tasks found."
-    lines = ["| Task | Status | Claimed By | Depends | Title |", "|---|---|---|---|---|"]
+    tasks.sort(key=lambda t: TASK_PRIORITY_ORDER.get(t.get("priority", "normal"), 2))
+    lines = ["| Task | Pri | Status | Claimed By | Labels | Depends | Title |", "|---|---|---|---|---|---|---|"]
     for t in tasks:
+        lbl = ",".join(t.get("labels", []) or []) or "—"
+        due = f" due={t.get('dueAt')}" if t.get("dueAt") else ""
         lines.append(
-            f"| {t.get('taskId')} | {t.get('status')} | {t.get('claimedBy') or '—'} | {','.join(t.get('dependsOn',[])) or '—'} | {t.get('title')} |"
+            f"| {t.get('taskId')} | {t.get('priority','normal')} | {t.get('status')} | {t.get('claimedBy') or '—'} | {lbl} | {','.join(t.get('dependsOn',[])) or '—'} | {t.get('title')}{due} |"
         )
     return "\n".join(lines)
 
@@ -1033,6 +1128,13 @@ def cmd_task_claim(args: argparse.Namespace) -> str:
         conflicts = _check_file_claim_conflicts(store, doc, task.get("files", []), task_id=args.task_id)
         if conflicts and not args.force:
             raise SystemExit("File-claim conflict(s):\n" + "\n".join(f"- {c}" for c in conflicts))
+        # Workload cap check
+        member_cfg = members.get(args.member_id) or {}
+        max_active = member_cfg.get("maxActiveTasks")
+        if max_active and not args.force:
+            active_count = sum(1 for t in doc.get("tasks", []) if t.get("claimedBy") == args.member_id and t.get("status") in {"claimed", "in_progress"})
+            if active_count >= int(max_active):
+                raise SystemExit(f"Member {args.member_id} has {active_count}/{max_active} active tasks (cap reached). Use --force to override.")
 
         previous_owner = task.get("claimedBy")
         task["claimedBy"] = args.member_id
@@ -1058,7 +1160,7 @@ def cmd_task_claim(args: argparse.Namespace) -> str:
 
 
 def cmd_task_update(args: argparse.Namespace) -> str:
-    allowed = {"pending", "blocked", "claimed", "in_progress", "completed", "cancelled"}
+    allowed = {"pending", "blocked", "claimed", "in_progress", "completed", "cancelled", "awaiting_approval"}
     if args.status not in allowed:
         raise SystemExit(f"Invalid status: {args.status}")
     store = TeamStore(args.team_id)
@@ -1073,24 +1175,53 @@ def cmd_task_update(args: argparse.Namespace) -> str:
             task["claimedBy"] = args.member_id
             task["claimedAt"] = utc_now()
         prev = task.get("status")
-        task["status"] = args.status
+        target_status = args.status
+        # Approval gate: if task requires approval and transitioning to in_progress, intercept
+        if target_status == "in_progress" and task.get("approvalRequired") and prev != "awaiting_approval":
+            target_status = "awaiting_approval"
+        task["status"] = target_status
         task["updatedAt"] = utc_now()
         if args.note:
             task["lastNote"] = args.note
-        task.setdefault("history", []).append({"ts": utc_now(), "action": f"status:{args.status}", "by": args.member_id or "unknown", "note": args.note})
-        if args.status in {"completed", "cancelled", "pending", "blocked"}:
+        # Update optional fields if provided
+        add_labels = getattr(args, "add_label", None) or []
+        remove_labels = getattr(args, "remove_label", None) or []
+        if add_labels:
+            existing = task.get("labels") or []
+            task["labels"] = list(dict.fromkeys(existing + [l.strip() for l in add_labels if l.strip()]))
+        if remove_labels:
+            task["labels"] = [l for l in (task.get("labels") or []) if l not in remove_labels]
+        est = getattr(args, "estimate_minutes", None)
+        if est is not None:
+            task["estimateMinutes"] = int(est)
+        due = getattr(args, "due_at", None)
+        if due is not None:
+            task["dueAt"] = due
+        sla = getattr(args, "sla_class", None)
+        if sla is not None:
+            if sla not in VALID_SLA_CLASSES:
+                raise SystemExit(f"Invalid SLA class: {sla}")
+            task["slaClass"] = sla
+        pri = getattr(args, "priority", None)
+        if pri is not None:
+            if pri not in VALID_TASK_PRIORITIES:
+                raise SystemExit(f"Invalid priority: {pri}")
+            task["priority"] = pri
+        task.setdefault("history", []).append({"ts": utc_now(), "action": f"status:{target_status}", "by": args.member_id or "unknown", "note": args.note})
+        if target_status in {"completed", "cancelled", "pending", "blocked"}:
             claim_file = claim_file_path(store, args.task_id)
             if claim_file.exists():
                 claim_file.unlink(missing_ok=True)
-            if args.status in {"completed", "cancelled"}:
+            if target_status in {"completed", "cancelled"}:
                 task["claimedBy"] = None
         _refresh_task_blocked_state(doc)
         store.save_tasks(doc)
 
-    store.emit_event("TaskUpdated", taskId=args.task_id, status=args.status, previousStatus=prev)
-    if args.status == "completed":
+    store.emit_event("TaskUpdated", taskId=args.task_id, status=target_status, previousStatus=prev)
+    if target_status == "completed":
         store.emit_event("TaskCompleted", taskId=args.task_id, completedBy=args.member_id or prev or "unknown", note=args.note or None)
-    return f"Task {args.task_id} updated: {prev} -> {args.status}."
+    suffix = f" (approval gate intercepted → awaiting_approval)" if target_status != args.status else ""
+    return f"Task {args.task_id} updated: {prev} -> {target_status}.{suffix}"
 
 
 def cmd_task_release_claim(args: argparse.Namespace) -> str:
@@ -1118,6 +1249,472 @@ def cmd_task_release_claim(args: argparse.Namespace) -> str:
         store.save_tasks(doc)
     store.emit_event("TaskClaimReleased", taskId=args.task_id, previousOwner=owner, by=args.member_id or "runtime")
     return f"Released claim on {args.task_id} (previous owner: {owner})."
+
+
+# ── Phase C: New task commands ──────────────────────────────────────────
+
+
+def cmd_task_template_list(args: argparse.Namespace) -> str:
+    lines = ["## Available Task Templates"]
+    for name, tmpl in TASK_TEMPLATES.items():
+        steps = " → ".join(t["suffix"] for t in tmpl["tasks"])
+        lines.append(f"- **{name}**: {tmpl['description']} ({steps})")
+    return "\n".join(lines)
+
+
+def cmd_task_template_apply(args: argparse.Namespace) -> str:
+    store = TeamStore(args.team_id)
+    if not store.exists():
+        raise SystemExit(f"Team {args.team_id} not found.")
+    template_name = args.template_name
+    if template_name not in TASK_TEMPLATES:
+        raise SystemExit(f"Unknown template: {template_name}. Available: {', '.join(TASK_TEMPLATES.keys())}")
+    tmpl = TASK_TEMPLATES[template_name]
+    prefix = args.prefix or template_name
+    assignees = (args.assignees or "").split(",") if getattr(args, "assignees", None) else []
+    assignees = [a.strip() for a in assignees if a.strip()]
+    created = []
+    with file_lock(store.paths.root / ".tasks.lock"):
+        doc = store.load_tasks()
+        for i, step in enumerate(tmpl["tasks"]):
+            task_id = f"{prefix}-{step['suffix']}"
+            if _get_task(doc, task_id):
+                continue
+            deps = [f"{prefix}-{d}" for d in step["dependsOn"]]
+            unmet = _dependency_unmet(doc, deps)
+            task = {
+                "taskId": task_id,
+                "title": f"[{prefix}] {step['title']}",
+                "description": "",
+                "status": "blocked" if deps else "pending",
+                "priority": "normal",
+                "dependsOn": deps,
+                "files": [],
+                "labels": [template_name],
+                "claimedBy": None,
+                "claimedAt": None,
+                "assignee": assignees[i] if i < len(assignees) else None,
+                "approvalRequired": False,
+                "estimateMinutes": None,
+                "dueAt": None,
+                "slaClass": None,
+                "createdAt": utc_now(),
+                "updatedAt": utc_now(),
+                "history": [{"ts": utc_now(), "action": "created", "by": "template"}],
+            }
+            doc["tasks"].append(task)
+            created.append(task_id)
+        store.save_tasks(doc)
+    for tid in created:
+        store.emit_event("TaskAdded", taskId=tid, title=f"Template: {template_name}", source="template")
+    return f"Applied template '{template_name}' with prefix '{prefix}': {len(created)} tasks created ({', '.join(created)})."
+
+
+def cmd_task_graph(args: argparse.Namespace) -> str:
+    store = TeamStore(args.team_id)
+    doc = store.load_tasks()
+    tasks = doc.get("tasks", [])
+    if not tasks:
+        return "No tasks found."
+    fmt = getattr(args, "format", "text") or "text"
+    # Build adjacency
+    task_map = {t["taskId"]: t for t in tasks}
+    # Find root blockers (tasks that block others and are themselves not completed)
+    blocked_by: dict[str, list[str]] = {}
+    for t in tasks:
+        for dep in (t.get("dependsOn") or []):
+            blocked_by.setdefault(dep, []).append(t["taskId"])
+    root_blockers = []
+    for t in tasks:
+        if t.get("status") not in {"completed", "cancelled"} and not (t.get("dependsOn") or []):
+            if t["taskId"] in blocked_by:
+                root_blockers.append(t["taskId"])
+
+    if fmt == "mermaid":
+        lines = ["```mermaid", "graph TD"]
+        status_style = {"completed": ":::done", "in_progress": ":::active", "blocked": ":::blocked", "claimed": ":::active"}
+        for t in tasks:
+            label = f"{t['taskId']}[{t['taskId']}: {t['title'][:30]}]"
+            lines.append(f"    {label}")
+            for dep in (t.get("dependsOn") or []):
+                lines.append(f"    {dep} --> {t['taskId']}")
+        lines.append("```")
+        if root_blockers:
+            lines.append(f"\nRoot blockers: {', '.join(root_blockers)}")
+        return "\n".join(lines)
+    else:
+        # Text tree
+        lines = ["## Task Dependency Graph"]
+        roots = [t for t in tasks if not (t.get("dependsOn") or [])]
+        visited: set[str] = set()
+
+        def _print_tree(tid: str, depth: int) -> None:
+            if tid in visited:
+                return
+            visited.add(tid)
+            t = task_map.get(tid)
+            if not t:
+                return
+            indent = "  " * depth
+            pri = f"[{t.get('priority','normal')}]" if t.get("priority", "normal") != "normal" else ""
+            lines.append(f"{indent}{'└─ ' if depth > 0 else ''}{tid} ({t.get('status')}) {pri} {t.get('title','')}")
+            for child in blocked_by.get(tid, []):
+                _print_tree(child, depth + 1)
+
+        for r in roots:
+            _print_tree(r["taskId"], 0)
+        # Any orphans
+        for t in tasks:
+            if t["taskId"] not in visited:
+                _print_tree(t["taskId"], 0)
+        if root_blockers:
+            lines.append(f"\nRoot blockers: {', '.join(root_blockers)}")
+        return "\n".join(lines)
+
+
+def cmd_task_rebalance(args: argparse.Namespace) -> str:
+    store = TeamStore(args.team_id)
+    cfg = store.load_config()
+    members = {m["memberId"]: m for m in cfg.get("members", []) if str(m.get("status")) not in {"paused", "removed"}}
+    if not members:
+        return "No available members for rebalancing."
+    force = bool(getattr(args, "force", False))
+    with file_lock(store.paths.root / ".tasks.lock"):
+        doc = store.load_tasks()
+        tasks = doc.get("tasks", [])
+        # Count active tasks per member
+        active_counts: dict[str, int] = {mid: 0 for mid in members}
+        for t in tasks:
+            if t.get("claimedBy") in active_counts and t.get("status") in {"claimed", "in_progress"}:
+                active_counts[t["claimedBy"]] += 1
+        # Find unclaimed pending tasks
+        pending = [t for t in tasks if t.get("status") == "pending" and not t.get("claimedBy")]
+        # Optionally find stalled claimed tasks
+        stalled = []
+        if force:
+            now = now_epoch()
+            for t in tasks:
+                if t.get("status") == "claimed" and t.get("claimedAt"):
+                    claimed_at = parse_ts(t["claimedAt"])
+                    if claimed_at and (now - claimed_at.timestamp()) > CLAIM_TTL_SECONDS:
+                        stalled.append(t)
+        rebalanceable = pending + stalled
+        if not rebalanceable:
+            return "No tasks to rebalance."
+        # Sort by priority
+        rebalanceable.sort(key=lambda t: TASK_PRIORITY_ORDER.get(t.get("priority", "normal"), 2))
+        assigned = []
+        for t in rebalanceable:
+            # Find least-loaded member
+            eligible = sorted(active_counts.items(), key=lambda x: x[1])
+            if not eligible:
+                break
+            target_mid = eligible[0][0]
+            # Check workload cap
+            member_cfg = members.get(target_mid, {})
+            max_active = member_cfg.get("maxActiveTasks")
+            if max_active and active_counts[target_mid] >= int(max_active):
+                continue
+            prev_owner = t.get("claimedBy")
+            t["claimedBy"] = target_mid
+            t["claimedAt"] = utc_now()
+            t["status"] = "claimed"
+            t["updatedAt"] = utc_now()
+            t.setdefault("history", []).append({"ts": utc_now(), "action": "rebalanced", "by": "runtime", "previousOwner": prev_owner})
+            active_counts[target_mid] += 1
+            assigned.append(f"{t['taskId']} → {target_mid}")
+        store.save_tasks(doc)
+    for a in assigned:
+        tid = a.split(" → ")[0]
+        store.emit_event("TaskRebalanced", taskId=tid, detail=a)
+    return f"Rebalanced {len(assigned)} task(s):\n" + "\n".join(f"- {a}" for a in assigned) if assigned else "No tasks could be rebalanced (all members at cap)."
+
+
+def _attribute_cost_to_task(store: TeamStore, task: dict[str, Any], member_id: str) -> dict[str, Any]:
+    """Approximate cost by looking at member's spend during task window."""
+    claimed_at = None
+    for h in task.get("history", []):
+        if h.get("action") in {"claimed", "status_change"} and h.get("newStatus") in {"claimed", "in_progress", None}:
+            claimed_at = h.get("ts")
+            break
+    if not claimed_at:
+        claimed_at = task.get("claimedAt") or task.get("createdAt")
+    completed_at = utc_now()
+    if not claimed_at:
+        return {"estimatedCostUSD": None, "confidence": "none", "method": "no_claim_window"}
+    # Look up member session ID
+    members = store.members_by_id()
+    m = members.get(member_id, {})
+    session_id = m.get("sessionId")
+    # Try to get cost for the member's session in the task window
+    try:
+        cost_script = CLAUDE_DIR / "scripts" / "cost_runtime.py"
+        if not cost_script.exists():
+            return {"estimatedCostUSD": None, "confidence": "none", "method": "cost_runtime_missing"}
+        argv = ["python3", str(cost_script), "summary", "--window", "custom", "--since", claimed_at[:10], "--until", completed_at[:10], "--json"]
+        if session_id:
+            argv += ["--session-id", session_id]
+        out = subprocess.run(argv, capture_output=True, text=True, timeout=10, check=False)
+        if out.returncode == 0 and out.stdout.strip():
+            data = json.loads(out.stdout)
+            total = (data.get("totals") or {}).get("totalUSD") or (data.get("totals") or {}).get("localCostUSD")
+            # Check if member had overlapping tasks
+            active_tasks = sum(1 for t in store.load_tasks().get("tasks", [])
+                             if t.get("claimedBy") == member_id and t.get("status") in {"claimed", "in_progress"} and t.get("taskId") != task.get("taskId"))
+            confidence = "high" if active_tasks == 0 else ("medium" if active_tasks <= 2 else "low")
+            return {
+                "estimatedCostUSD": round(float(total), 4) if total is not None else None,
+                "confidence": confidence,
+                "method": "session_window",
+                "window": {"from": claimed_at, "to": completed_at},
+                "sessionId": session_id,
+                "overlappingTasks": active_tasks,
+            }
+    except Exception as e:
+        return {"estimatedCostUSD": None, "confidence": "none", "method": f"error: {str(e)[:100]}"}
+    return {"estimatedCostUSD": None, "confidence": "none", "method": "no_data"}
+
+
+def cmd_task_complete_with_outcome(args: argparse.Namespace) -> str:
+    store = TeamStore(args.team_id)
+    with file_lock(store.paths.root / ".tasks.lock"):
+        doc = store.load_tasks()
+        task = _get_task(doc, args.task_id)
+        if not task:
+            raise SystemExit(f"Task {args.task_id} not found.")
+        outcome = {
+            "filesTouched": [f.strip() for f in (args.files_touched or "").split(",") if f.strip()] if args.files_touched else [],
+            "testsRun": [t.strip() for t in (args.tests_run or "").split(",") if t.strip()] if args.tests_run else [],
+            "risks": args.risks or "",
+            "followUps": [f.strip() for f in (args.follow_ups or "").split(",") if f.strip()] if args.follow_ups else [],
+            "note": args.note or "",
+        }
+        # Cost attribution
+        cost_attr = _attribute_cost_to_task(store, task, args.member_id or "unknown")
+        outcome["costAttribution"] = cost_attr
+        prev = task.get("status")
+        task["status"] = "completed"
+        task["outcome"] = outcome
+        task["claimedBy"] = None
+        task["updatedAt"] = utc_now()
+        task.setdefault("history", []).append({"ts": utc_now(), "action": "completed_with_outcome", "by": args.member_id or "unknown", "outcome": outcome})
+        cf = claim_file_path(store, args.task_id)
+        if cf.exists():
+            cf.unlink(missing_ok=True)
+        _refresh_task_blocked_state(doc)
+        store.save_tasks(doc)
+    store.emit_event("TaskCompleted", taskId=args.task_id, completedBy=args.member_id or "unknown", hasOutcome=True, costAttribution=cost_attr)
+    cost_msg = f" Cost: ~${cost_attr.get('estimatedCostUSD', 'n/a')} ({cost_attr.get('confidence', 'n/a')})" if cost_attr.get("estimatedCostUSD") is not None else ""
+    return f"Task {args.task_id} completed with outcome. Files: {len(outcome['filesTouched'])}, Tests: {len(outcome['testsRun'])}, Follow-ups: {len(outcome['followUps'])}.{cost_msg}"
+
+
+def cmd_task_approve(args: argparse.Namespace) -> str:
+    store = TeamStore(args.team_id)
+    with file_lock(store.paths.root / ".tasks.lock"):
+        doc = store.load_tasks()
+        task = _get_task(doc, args.task_id)
+        if not task:
+            raise SystemExit(f"Task {args.task_id} not found.")
+        if task.get("status") != "awaiting_approval":
+            raise SystemExit(f"Task {args.task_id} is not awaiting approval (status={task.get('status')}).")
+        task["status"] = "in_progress"
+        task["updatedAt"] = utc_now()
+        task.setdefault("history", []).append({"ts": utc_now(), "action": "approved", "by": args.approved_by or "lead"})
+        store.save_tasks(doc)
+    store.emit_event("TaskApproved", taskId=args.task_id, approvedBy=args.approved_by or "lead")
+    return f"Task {args.task_id} approved → in_progress."
+
+
+def cmd_task_import(args: argparse.Namespace) -> str:
+    store = TeamStore(args.team_id)
+    if not store.exists():
+        raise SystemExit(f"Team {args.team_id} not found.")
+    file_path = Path(args.file_path)
+    if not file_path.exists():
+        raise SystemExit(f"File not found: {file_path}")
+    fmt = (args.format or "json").lower()
+    raw = file_path.read_text(encoding="utf-8")
+    tasks_to_import: list[dict[str, Any]] = []
+    if fmt == "json":
+        data = json.loads(raw)
+        if isinstance(data, list):
+            tasks_to_import = data
+        elif isinstance(data, dict) and "tasks" in data:
+            tasks_to_import = data["tasks"]
+        else:
+            raise SystemExit("JSON must be an array of tasks or {tasks: [...]}")
+    elif fmt == "csv":
+        import csv
+        import io
+        reader = csv.DictReader(io.StringIO(raw))
+        for row in reader:
+            tasks_to_import.append({
+                "taskId": row.get("taskId") or row.get("task_id") or f"T{int(time.time() * 1000)}",
+                "title": row.get("title", ""),
+                "description": row.get("description", ""),
+                "priority": row.get("priority", "normal"),
+                "labels": [l.strip() for l in (row.get("labels") or "").split(",") if l.strip()],
+            })
+    elif fmt == "md":
+        for line in raw.split("\n"):
+            m = re.match(r"^\s*-\s*\[[ x]\]\s*(.+)", line)
+            if m:
+                title = m.group(1).strip()
+                tasks_to_import.append({"title": title, "taskId": f"T{int(time.time() * 1000)}"})
+                time.sleep(0.001)  # Ensure unique IDs
+    else:
+        raise SystemExit(f"Unsupported format: {fmt}. Use json, csv, or md.")
+    created = 0
+    with file_lock(store.paths.root / ".tasks.lock"):
+        doc = store.load_tasks()
+        for t in tasks_to_import:
+            tid = safe_id(t.get("taskId") or f"T{int(time.time() * 1000)}", "taskId")
+            if _get_task(doc, tid):
+                continue
+            task = {
+                "taskId": tid,
+                "title": t.get("title", "Untitled"),
+                "description": t.get("description", ""),
+                "status": "pending",
+                "priority": t.get("priority", "normal"),
+                "dependsOn": t.get("dependsOn") or [],
+                "files": t.get("files") or [],
+                "labels": t.get("labels") or [],
+                "claimedBy": None,
+                "claimedAt": None,
+                "assignee": t.get("assignee"),
+                "approvalRequired": bool(t.get("approvalRequired")),
+                "estimateMinutes": t.get("estimateMinutes"),
+                "dueAt": t.get("dueAt"),
+                "slaClass": t.get("slaClass"),
+                "createdAt": utc_now(),
+                "updatedAt": utc_now(),
+                "history": [{"ts": utc_now(), "action": "imported", "by": "import"}],
+            }
+            doc["tasks"].append(task)
+            created += 1
+        _refresh_task_blocked_state(doc)
+        store.save_tasks(doc)
+    return f"Imported {created} task(s) from {fmt} file."
+
+
+def cmd_task_export(args: argparse.Namespace) -> str:
+    store = TeamStore(args.team_id)
+    doc = store.load_tasks()
+    tasks = doc.get("tasks", [])
+    fmt = (args.format or "json").lower()
+    if fmt == "json":
+        return json.dumps(tasks, indent=2, default=str)
+    elif fmt == "csv":
+        if not tasks:
+            return "taskId,title,status,priority,labels,assignee,dueAt\n"
+        lines = ["taskId,title,status,priority,labels,assignee,dueAt"]
+        for t in tasks:
+            labels = ";".join(t.get("labels") or [])
+            lines.append(f"{t.get('taskId','')},{t.get('title','')},{t.get('status','')},{t.get('priority','normal')},{labels},{t.get('assignee') or ''},{t.get('dueAt') or ''}")
+        return "\n".join(lines)
+    elif fmt == "md":
+        lines = ["# Task Board"]
+        for t in tasks:
+            check = "x" if t.get("status") == "completed" else " "
+            lines.append(f"- [{check}] **{t.get('taskId')}** [{t.get('priority','normal')}] {t.get('title','')}")
+        return "\n".join(lines)
+    else:
+        raise SystemExit(f"Unsupported format: {fmt}")
+
+
+# ── Phase C: New message commands ──────────────────────────────────────
+
+
+def cmd_message_thread(args: argparse.Namespace) -> str:
+    store = TeamStore(args.team_id)
+    thread_id = safe_id(args.thread_id, "thread_id")
+    all_msgs = list(latest_messages_by_id(store).values())
+    thread_msgs = [m for m in all_msgs if m.get("threadId") == thread_id]
+    if not thread_msgs:
+        ledger = load_message_ledger(store)
+        thread_msgs = [m for m in ledger if m.get("threadId") == thread_id]
+    thread_msgs.sort(key=lambda m: m.get("ts", ""))
+    if not thread_msgs:
+        return f"No messages found for thread {thread_id}."
+    lines = [f"## Thread {thread_id} ({len(thread_msgs)} message(s))"]
+    for m in thread_msgs:
+        status = m.get("status", "unknown")
+        lines.append(f"- {m.get('ts')} {m.get('fromMember')} → {m.get('toMember')} [{m.get('priority','normal')}] ({status}) {m.get('content','')[:100]}")
+    return "\n".join(lines)
+
+
+def cmd_message_receipts_dashboard(args: argparse.Namespace) -> str:
+    store = TeamStore(args.team_id)
+    stats = _message_stats(store)
+    lines = [
+        f"## Message Receipts Dashboard: {store.team_id}",
+        f"- Total: {stats['total']} | Open: {stats['open']} | Acked: {stats['acked']}",
+        f"- Queue Depth: {stats.get('queueDepth', 0)} | Delivered (unacked): {stats.get('deliveredCount', 0)}",
+        f"- Stale: {stats['staleOpen']}",
+        f"- Ack Latency: avg={stats.get('avgAckSeconds') or '—'}s p50={stats.get('ackLatencyP50') or '—'}s p95={stats.get('ackLatencyP95') or '—'}s",
+    ]
+    retry = stats.get("retryHistogram", {})
+    if retry:
+        lines.append(f"- Retry Histogram: {', '.join(f'{k}x:{v}' for k, v in retry.items())}")
+    sbm = stats.get("staleByMember", {})
+    if sbm:
+        lines.append("- Stale by Member: " + ", ".join(f"{k}={v}" for k, v in sorted(sbm.items(), key=lambda x: -x[1])))
+    sbp = stats.get("staleByPriority", {})
+    if sbp:
+        lines.append("- Stale by Priority: " + ", ".join(f"{k}={v}" for k, v in sbp.items()))
+    return "\n".join(lines)
+
+
+def cmd_team_announce(args: argparse.Namespace) -> str:
+    store = TeamStore(args.team_id)
+    cfg = store.load_config()
+    members_list = cfg.get("members", [])
+    if not members_list:
+        return "No members to announce to."
+    message_id = f"ANN{int(time.time() * 1000)}"
+    sticky = bool(getattr(args, "sticky", False))
+    msg = {
+        "id": message_id,
+        "ts": utc_now(),
+        "fromMember": "lead",
+        "toMember": "all",
+        "priority": getattr(args, "priority", "normal") or "normal",
+        "content": args.content,
+        "channelType": "announcement",
+        "sticky": sticky,
+        "status": "delivered",
+        "deliveredAt": utc_now(),
+        "acknowledgedAt": None,
+        "retryCount": 0,
+        "threadId": message_id,
+    }
+    append_message_ledger(store, msg)
+    # Deliver to all member mailboxes
+    for m in members_list:
+        mid = m.get("memberId")
+        if mid:
+            mailbox = store.paths.mailbox_dir / f"{mid}.jsonl"
+            append_jsonl(mailbox, msg)
+    store.emit_event("TeamAnnouncement", messageId=message_id, sticky=sticky, content=args.content[:100])
+    return f"Announcement {message_id} delivered to {len(members_list)} member(s). Sticky: {sticky}."
+
+
+def cmd_message_announcements(args: argparse.Namespace) -> str:
+    store = TeamStore(args.team_id)
+    ledger = load_message_ledger(store)
+    announcements = [m for m in ledger if m.get("channelType") == "announcement" and m.get("status") != "acknowledged"]
+    if not announcements:
+        return "No active announcements."
+    # Deduplicate by id (keep latest)
+    by_id: dict[str, dict[str, Any]] = {}
+    for a in announcements:
+        by_id[a.get("id", "")] = a
+    lines = [f"## Announcements ({len(by_id)})"]
+    for aid, a in by_id.items():
+        sticky_tag = " [STICKY]" if a.get("sticky") else ""
+        lines.append(f"- {a.get('ts')} {aid}{sticky_tag} [{a.get('priority','normal')}]: {a.get('content','')[:100]}")
+    return "\n".join(lines)
 
 
 def cmd_event_check(args: argparse.Namespace) -> str:
@@ -1283,14 +1880,32 @@ def cmd_team_reconcile(args: argparse.Namespace) -> str:
     if args.include_workers:
         worker_msg = cmd_hook_reconcile_workers(argparse.Namespace())
     lead_alerts = _emit_escalation_alerts(store)
-    store.emit_event("TeamReconciled", expiredClaims=len(expired), compactedEvents=compacted)
-    bits = [f"Reconciled team {store.team_id}: expired_claims={len(expired)} compacted_events={compacted}"]
+    # Check overdue tasks
+    overdue_count = 0
+    now_str = utc_now()
+    tasks_doc = store.load_tasks()
+    for t in tasks_doc.get("tasks", []):
+        if t.get("status") in {"completed", "cancelled"}:
+            continue
+        if t.get("dueAt") and t["dueAt"] < now_str:
+            store.emit_event("TaskOverdueWarning", taskId=t["taskId"], dueAt=t["dueAt"])
+            overdue_count += 1
+    # Check message SLA violations
+    msg_stats = _message_stats(store)
+    for sm in msg_stats.get("staleMessages", []):
+        store.emit_event("PeerMessageStale", messageId=sm.get("id"), ageSeconds=sm.get("ageSeconds"), priority=sm.get("priority"))
+    # Budget enforcement
+    budget_actions = _check_budget_enforcement(store)
+    store.emit_event("TeamReconciled", expiredClaims=len(expired), compactedEvents=compacted, overdueTaskCount=overdue_count, budgetActions=budget_actions)
+    bits = [f"Reconciled team {store.team_id}: expired_claims={len(expired)} compacted_events={compacted} overdue_tasks={overdue_count}"]
     if expired:
         bits.append("Expired claims: " + ", ".join(expired))
     if worker_msg:
         bits.append(worker_msg)
     if lead_alerts:
         bits.append(f"Lead alerts emitted: {lead_alerts}")
+    if budget_actions:
+        bits.append(f"Budget actions: {', '.join(budget_actions)}")
     return "\n".join(bits)
 
 
@@ -1352,16 +1967,65 @@ def cmd_team_dashboard(args: argparse.Namespace) -> str:
         f"## Team Dashboard: {store.team_id}",
         f"- State: {rt.get('state','unknown')} | tmux: {rt.get('tmux_session') or '—'}",
         f"- Members: {len(cfg.get('members', []))} | Messages(open): {pending_msgs}",
-        f"- Delivery: open={msg_stats.get('open',0)} stale={msg_stats.get('staleOpen',0)} avg_ack_s={msg_stats.get('avgAckSeconds') if msg_stats.get('avgAckSeconds') is not None else '—'}",
-        f"- Tasks: pending={task_counts.get('pending',0)} blocked={task_counts.get('blocked',0)} claimed={task_counts.get('claimed',0)} in_progress={task_counts.get('in_progress',0)} completed={task_counts.get('completed',0)}",
+        f"- Delivery: open={msg_stats.get('open',0)} stale={msg_stats.get('staleOpen',0)} queue={msg_stats.get('queueDepth',0)} avg_ack={msg_stats.get('avgAckSeconds') or '—'}s p50={msg_stats.get('ackLatencyP50') or '—'}s p95={msg_stats.get('ackLatencyP95') or '—'}s",
+        f"- Tasks: pending={task_counts.get('pending',0)} blocked={task_counts.get('blocked',0)} claimed={task_counts.get('claimed',0)} in_progress={task_counts.get('in_progress',0)} awaiting_approval={task_counts.get('awaiting_approval',0)} completed={task_counts.get('completed',0)}",
     ]
+    # Stale by priority
+    sbp = msg_stats.get("staleByPriority", {})
+    if sbp:
+        lines.append(f"- Stale by Priority: {', '.join(f'{k}={v}' for k, v in sbp.items())}")
+    # Task priority distribution
+    tasks = tasks_doc.get("tasks", [])
+    pri_dist: dict[str, int] = {}
+    label_dist: dict[str, int] = {}
+    overdue: list[str] = []
+    now_str = utc_now()
+    for t in tasks:
+        if t.get("status") in {"completed", "cancelled"}:
+            continue
+        p = t.get("priority", "normal")
+        pri_dist[p] = pri_dist.get(p, 0) + 1
+        for lbl in (t.get("labels") or []):
+            label_dist[lbl] = label_dist.get(lbl, 0) + 1
+        if t.get("dueAt") and t["dueAt"] < now_str:
+            overdue.append(f"{t['taskId']} (due {t['dueAt']})")
+    if pri_dist:
+        lines.append(f"- Task Priorities: {', '.join(f'{k}={v}' for k, v in sorted(pri_dist.items(), key=lambda x: TASK_PRIORITY_ORDER.get(x[0], 2)))}")
+    if label_dist:
+        lines.append(f"- Labels: {', '.join(f'{k}={v}' for k, v in sorted(label_dist.items(), key=lambda x: -x[1])[:10])}")
+    if overdue:
+        lines.append(f"- OVERDUE: {', '.join(overdue[:5])}")
     cost = _try_cost_summary(store.team_id)
     if cost:
         lines.append("\n### Cost (Today)")
         lines.append(cost)
+    # Budget enforcement status
+    bp = cfg.get("budgetPolicy", {})
+    if bp:
+        bp_parts = []
+        if bp.get("dailyCapUSD"):
+            bp_parts.append(f"cap=${bp['dailyCapUSD']}")
+        if bp.get("modelPolicy"):
+            bp_parts.append(f"model={bp['modelPolicy']}")
+        if bp.get("autoDownshift"):
+            bp_parts.append("auto-downshift=ON")
+        if bp.get("presetOverride"):
+            bp_parts.append(f"preset-override={bp['presetOverride']}")
+        if bp_parts:
+            lines.append(f"- Budget Policy: {', '.join(bp_parts)}")
+    # Burn-rate projection
+    snapshot = _cost_snapshot_json(store.team_id, timeout_sec=4)
+    if snapshot.get("ok"):
+        budget = (snapshot.get("summary", {}).get("budget") or {})
+        if budget.get("pct") is not None:
+            lines.append(f"- Budget: {budget.get('level','?')} ({budget.get('pct')}% of ${budget.get('limitUSD','?')})")
     lines.append("\n### Members")
     for m in cfg.get("members", []):
-        lines.append(f"- {m.get('memberId')}: role={m.get('role')} kind={m.get('kind')} status={m.get('status')} session={m.get('sessionId') or '—'} pane={m.get('paneId') or '—'}")
+        mid = m.get("memberId")
+        active_count = sum(1 for t in tasks if t.get("claimedBy") == mid and t.get("status") in {"claimed", "in_progress"})
+        max_active = m.get("maxActiveTasks")
+        workload = f" tasks={active_count}" + (f"/{max_active}" if max_active else "")
+        lines.append(f"- {mid}: role={m.get('role')} kind={m.get('kind')} status={m.get('status')}{workload} session={m.get('sessionId') or '—'} pane={m.get('paneId') or '—'}")
     lines.append("\n### Recent Events")
     if not events:
         lines.append("- none")
@@ -1401,6 +2065,21 @@ def _auto_bootstrap_preset(team_id: str) -> tuple[str, dict[str, Any]]:
     fallback = str(prof.get("fallbackPreset") or "standard")
     no_budget = str(prof.get("noBudgetPreset") or fallback)
     meta: dict[str, Any] = {"mode": "auto", "profile": prof_name, "selectedPreset": fallback, "reason": "fallback"}
+    # Check per-team budget policy override first
+    try:
+        team_store = TeamStore(team_id)
+        if team_store.exists():
+            team_cfg = team_store.load_config()
+            bp = team_cfg.get("budgetPolicy", {})
+            if bp.get("presetOverride"):
+                preset = str(bp["presetOverride"])
+                meta.update({"selectedPreset": preset, "reason": "team_budget_policy_override", "policySource": "budgetPolicy.presetOverride"})
+                return preset, meta
+            if bp.get("dailyCapUSD"):
+                # Use team-specific budget cap for decision
+                meta["policySource"] = "budgetPolicy.dailyCapUSD"
+    except Exception:
+        pass
     try:
         budgets_doc = read_json(COST_BUDGETS_FILE, {}) or {}
         cache_doc = read_json(COST_CACHE_FILE, {}) or {}
@@ -1568,7 +2247,9 @@ def cmd_team_bootstrap(args: argparse.Namespace) -> str:
         if existing and existing.get("paneId"):
             skipped.append(member_id)
             continue
-        cmd_teammate_spawn_pane(argparse.Namespace(team_id=team_id, member_id=member_id, name=member_id, role=role, cwd=cwd, agent=None, model=None, initial_prompt=None))
+        ns = argparse.Namespace(team_id=team_id, member_id=member_id, name=member_id, role=role, cwd=cwd, agent=None, model=None, initial_prompt=None)
+        ns._effective_preset = preset  # pass preset for model policy resolution
+        cmd_teammate_spawn_pane(ns)
         spawned.append(member_id)
         existing_members = TeamStore(team_id).members_by_id()
     store = TeamStore(team_id)
@@ -1750,19 +2431,42 @@ def cmd_team_resume_all(args: argparse.Namespace) -> str:
     return "\n".join(out)
 
 
+def _get_sla_thresholds(store: TeamStore) -> dict[str, int]:
+    cfg = store.load_config()
+    overrides = cfg.get("messageSLA") or {}
+    thresholds = dict(MESSAGE_SLA_THRESHOLDS)
+    for k, v in overrides.items():
+        if k in thresholds and isinstance(v, (int, float)):
+            thresholds[k] = int(v)
+    return thresholds
+
+
 def _message_stats(store: TeamStore) -> dict[str, Any]:
     rows = list(latest_messages_by_id(store).values())
     now = datetime.now(timezone.utc)
+    thresholds = _get_sla_thresholds(store)
     open_rows = [m for m in rows if m.get("status") in {"queued", "delivered"}]
     acked = [m for m in rows if m.get("status") == "acknowledged"]
     stale_open = []
+    stale_by_member: dict[str, int] = {}
+    stale_by_priority: dict[str, int] = {}
+    queue_depth = sum(1 for m in open_rows if m.get("status") == "queued")
+    delivered_count = sum(1 for m in open_rows if m.get("status") == "delivered")
+    retry_counts: dict[int, int] = {}
     for m in open_rows:
+        rc = int(m.get("retryCount", 0))
+        retry_counts[rc] = retry_counts.get(rc, 0) + 1
         ts = parse_ts(m.get("ts"))
         if not ts:
             continue
         age_s = (now - ts).total_seconds()
-        if age_s >= 300:
-            stale_open.append({"id": m.get("id"), "ageSeconds": int(age_s), "toMember": m.get("toMember"), "priority": m.get("priority")})
+        pri = m.get("priority", "normal")
+        threshold = thresholds.get(pri, thresholds.get("normal", 900))
+        if age_s >= threshold:
+            stale_open.append({"id": m.get("id"), "ageSeconds": int(age_s), "toMember": m.get("toMember"), "priority": pri})
+            member = m.get("toMember", "unknown")
+            stale_by_member[member] = stale_by_member.get(member, 0) + 1
+            stale_by_priority[pri] = stale_by_priority.get(pri, 0) + 1
     ack_latencies = []
     for m in acked:
         mts = parse_ts(m.get("ts"))
@@ -1770,33 +2474,92 @@ def _message_stats(store: TeamStore) -> dict[str, Any]:
         if mts and ats:
             ack_latencies.append(max(0, int((ats - mts).total_seconds())))
     avg_ack = (sum(ack_latencies) / len(ack_latencies)) if ack_latencies else None
+    ack_latencies_sorted = sorted(ack_latencies)
+    p50 = ack_latencies_sorted[len(ack_latencies_sorted) // 2] if ack_latencies_sorted else None
+    p95_idx = int(len(ack_latencies_sorted) * 0.95) if ack_latencies_sorted else 0
+    p95 = ack_latencies_sorted[min(p95_idx, len(ack_latencies_sorted) - 1)] if ack_latencies_sorted else None
     return {
         "total": len(rows),
         "open": len(open_rows),
         "acked": len(acked),
         "staleOpen": len(stale_open),
+        "queueDepth": queue_depth,
+        "deliveredCount": delivered_count,
+        "retryHistogram": dict(sorted(retry_counts.items())),
         "avgAckSeconds": round(avg_ack, 2) if avg_ack is not None else None,
+        "ackLatencyP50": p50,
+        "ackLatencyP95": p95,
+        "staleByMember": stale_by_member,
+        "staleByPriority": stale_by_priority,
         "staleMessages": sorted(stale_open, key=lambda r: r["ageSeconds"], reverse=True)[:20],
     }
 
 
-def _emit_escalation_alerts(store: TeamStore) -> int:
-    stats = _message_stats(store)
-    if stats.get("staleOpen", 0) <= 0:
-        return 0
+def _evaluate_escalation_rules(store: TeamStore) -> int:
+    """Configurable escalation rules engine. Returns count of alerts emitted."""
     cfg = store.load_config()
-    idle_members = {str(m.get("memberId")) for m in cfg.get("members", []) if str(m.get("status")) in {"idle", "paused"}}
-    blocked_tasks = [t for t in (store.load_tasks().get("tasks", []) or []) if t.get("status") == "blocked"]
-    if not blocked_tasks or not idle_members:
-        return 0
-    store.emit_event(
-        "LeadAlert",
-        reason="stale_unacked_messages_with_blocked_tasks",
-        staleOpen=int(stats["staleOpen"]),
-        blockedTasks=[t.get("taskId") for t in blocked_tasks[:20]],
-        idleMembers=sorted(list(idle_members))[:20],
-    )
-    return 1
+    rules = cfg.get("escalationRules") or [
+        {"condition": "idle_member_blocked_task_stale_message", "action": "LeadAlert"},
+        {"condition": "high_queue_depth", "threshold": 10, "action": "LeadAlert"},
+        {"condition": "urgent_unacked_gt", "threshold": 120, "action": "LeadAlert"},
+    ]
+    stats = _message_stats(store)
+    tasks_doc = store.load_tasks()
+    members_list = cfg.get("members", [])
+    alerts = 0
+
+    # Gather restart counts from events
+    events = read_jsonl(store.paths.events)
+    restart_counts: dict[str, int] = {}
+    for e in events:
+        if e.get("type") == "MemberRestarted":
+            mid = e.get("memberId", "")
+            restart_counts[mid] = restart_counts.get(mid, 0) + 1
+
+    for rule in rules:
+        cond = rule.get("condition", "")
+        action = rule.get("action", "LeadAlert")
+
+        if cond == "idle_member_blocked_task_stale_message":
+            if stats.get("staleOpen", 0) <= 0:
+                continue
+            idle_members = {str(m.get("memberId")) for m in members_list if str(m.get("status")) in {"idle", "paused"}}
+            blocked_tasks = [t for t in (tasks_doc.get("tasks", []) or []) if t.get("status") == "blocked"]
+            if blocked_tasks and idle_members:
+                store.emit_event(action, reason=cond,
+                    staleOpen=int(stats["staleOpen"]),
+                    blockedTasks=[t.get("taskId") for t in blocked_tasks[:20]],
+                    idleMembers=sorted(list(idle_members))[:20])
+                alerts += 1
+
+        elif cond == "high_queue_depth":
+            threshold = int(rule.get("threshold", 10))
+            if stats.get("queueDepth", 0) >= threshold:
+                store.emit_event(action, reason=cond, queueDepth=stats["queueDepth"], threshold=threshold)
+                alerts += 1
+
+        elif cond == "urgent_unacked_gt":
+            threshold = int(rule.get("threshold", 120))
+            for sm in stats.get("staleMessages", []):
+                if sm.get("priority") == "urgent" and sm.get("ageSeconds", 0) > threshold:
+                    store.emit_event(action, reason=cond, messageId=sm.get("id"), ageSeconds=sm["ageSeconds"], threshold=threshold)
+                    alerts += 1
+                    break
+
+        elif cond == "repeated_restart":
+            member_threshold = int(rule.get("memberThreshold", 3))
+            for mid, count in restart_counts.items():
+                if count >= member_threshold:
+                    store.emit_event(action, reason=cond, memberId=mid, restartCount=count, threshold=member_threshold)
+                    alerts += 1
+                    break
+
+    return alerts
+
+
+def _emit_escalation_alerts(store: TeamStore) -> int:
+    """Backward-compatible wrapper for the escalation rules engine."""
+    return _evaluate_escalation_rules(store)
 
 
 def cmd_message_broadcast(args: argparse.Namespace) -> str:
@@ -1833,6 +2596,15 @@ def cmd_message_broadcast(args: argparse.Namespace) -> str:
         }
         if args.reply_to_message_id:
             msg["replyToMessageId"] = safe_id(args.reply_to_message_id, "reply_to_message_id")
+        # Thread correlation for broadcast
+        thread_id = getattr(args, "thread_id", None)
+        if thread_id:
+            msg["threadId"] = safe_id(thread_id, "thread_id")
+        elif msg.get("replyToMessageId"):
+            parent = latest_messages_by_id(store).get(msg["replyToMessageId"])
+            msg["threadId"] = parent.get("threadId", msg["replyToMessageId"]) if parent else msg["replyToMessageId"]
+        else:
+            msg["threadId"] = msg_id
         delivery = _deliver_to_member_session(store, m, msg)
         msg.update(delivery)
         append_message_ledger(store, msg)
@@ -1854,11 +2626,99 @@ def cmd_message_broadcast(args: argparse.Namespace) -> str:
     return f"Broadcast sent to {len(targets)} member(s): delivered={delivered} queued={queued}."
 
 
+def cmd_team_set_budget_policy(args: argparse.Namespace) -> str:
+    store = TeamStore(args.team_id)
+    if not store.exists():
+        raise SystemExit(f"Team {args.team_id} not found.")
+    cfg = store.load_config()
+    policy = cfg.get("budgetPolicy", {})
+    if getattr(args, "daily_cap_usd", None) is not None:
+        policy["dailyCapUSD"] = float(args.daily_cap_usd)
+    if getattr(args, "model_policy", None) is not None:
+        policy["modelPolicy"] = args.model_policy
+    if getattr(args, "auto_downshift", False):
+        policy["autoDownshift"] = True
+    if getattr(args, "no_auto_downshift", False):
+        policy["autoDownshift"] = False
+    if getattr(args, "warn_pct", None) is not None:
+        policy["warnPct"] = float(args.warn_pct)
+    if getattr(args, "crit_pct", None) is not None:
+        policy["critPct"] = float(args.crit_pct)
+    if getattr(args, "preset_override", None) is not None:
+        policy["presetOverride"] = args.preset_override
+    cfg["budgetPolicy"] = policy
+    store.save_config(cfg)
+    store.emit_event("BudgetPolicyUpdated", policy=policy)
+    return f"Budget policy updated for team {store.team_id}: {json.dumps(policy)}"
+
+
+def _check_budget_enforcement(store: TeamStore) -> list[str]:
+    """Check budget thresholds and auto-downshift if enabled. Called from reconcile."""
+    cfg = store.load_config()
+    policy = cfg.get("budgetPolicy", {})
+    actions: list[str] = []
+    # Get current budget status
+    snapshot = _cost_snapshot_json(store.team_id, timeout_sec=6)
+    if not snapshot.get("ok"):
+        return actions
+    summary = snapshot.get("summary", {})
+    budget = summary.get("budget", {})
+    level = budget.get("level")
+    pct = budget.get("pct")
+    # Burn-rate projection alert
+    projection = {}
+    try:
+        cost_script = CLAUDE_DIR / "scripts" / "cost_runtime.py"
+        if cost_script.exists():
+            out = subprocess.run(
+                ["python3", str(cost_script), "burn-rate-check", "--team-id", store.team_id, "--json"],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+            if out.returncode == 0 and out.stdout.strip():
+                projection = json.loads(out.stdout)
+    except Exception:
+        pass
+    if projection.get("alert"):
+        store.emit_event("BurnRateAlert", message=projection.get("message"), hoursToExhaustion=projection.get("hoursToExhaustion"), projectedDailyUSD=projection.get("projectedDailyUSD"))
+        actions.append(f"burn-rate alert: {projection.get('message', '')}")
+    # Auto-downshift logic
+    if not policy.get("autoDownshift"):
+        return actions
+    if level == "critical":
+        store.emit_event("BudgetDownshiftApplied", preset="lite", reason="critical_budget", budgetPct=pct)
+        try:
+            cmd_team_scale_to_preset(argparse.Namespace(team_id=store.team_id, preset="lite", cwd=None, hard_downshift=False, budget_aware=False, dry_run=False))
+            actions.append(f"auto-downshifted to lite (critical budget, pct={pct})")
+        except Exception as e:
+            actions.append(f"auto-downshift failed: {e}")
+    elif level == "warning":
+        store.emit_event("BudgetDownshiftSuggested", suggestedPreset="lite", currentLevel=level, budgetPct=pct)
+        actions.append(f"budget warning (pct={pct}), downshift suggested")
+    return actions
+
+
 def cmd_team_scale_to_preset(args: argparse.Namespace) -> str:
     store = TeamStore(args.team_id)
     if not store.exists():
         raise SystemExit(f"Team {args.team_id} not found.")
     preset = str(args.preset or "standard").lower()
+    # Budget-aware mode: override preset from budget recommendation
+    if getattr(args, "budget_aware", False):
+        auto_preset, auto_meta = _auto_bootstrap_preset(store.team_id)
+        # Check queue depth: if urgent tasks pending, resist downshift
+        tasks_doc = store.load_tasks()
+        urgent_pending = sum(1 for t in tasks_doc.get("tasks", []) if t.get("status") in {"pending", "blocked"} and t.get("priority") in {"high", "critical"})
+        if urgent_pending > 0 and auto_preset == "lite" and preset != "lite":
+            auto_preset = "standard"
+            auto_meta["reason"] = f"overridden_from_lite: {urgent_pending} urgent tasks pending"
+        preset = auto_preset
+    # Dry-run mode: show what would happen without doing it
+    if getattr(args, "dry_run", False):
+        specs = _preset_specs_for_name(preset)
+        members = store.members_by_id()
+        would_spawn = [s.split(":")[0] for s in specs if s.split(":")[0] not in members or not members.get(s.split(":")[0], {}).get("paneId")]
+        would_pause = [mid for mid in members if mid not in {s.split(":")[0] for s in specs} and mid != (store.load_config().get("leadMemberId") or "lead")]
+        return f"DRY RUN scale to {preset}: would_spawn={would_spawn} would_pause={would_pause}"
     specs = _preset_specs_for_name(preset)
     desired: dict[str, tuple[str, str | None]] = {}
     for spec in specs:
@@ -1875,7 +2735,9 @@ def cmd_team_scale_to_preset(args: argparse.Namespace) -> str:
             if m.get("status") == "paused":
                 _update_member(store, mid, lambda nm: nm.update({"status": "idle", "resumeAt": utc_now()}))
             continue
-        cmd_teammate_spawn_pane(argparse.Namespace(team_id=store.team_id, member_id=mid, name=mid, role=role, cwd=cwd or cwd_default or str(HOME), agent=None, model=None, initial_prompt=None))
+        ns = argparse.Namespace(team_id=store.team_id, member_id=mid, name=mid, role=role, cwd=cwd or cwd_default or str(HOME), agent=None, model=None, initial_prompt=None)
+        ns._effective_preset = preset  # pass preset for model policy resolution
+        cmd_teammate_spawn_pane(ns)
         spawned.append(mid)
         members = store.members_by_id()
     for mid, m in list(members.items()):
@@ -2764,6 +3626,26 @@ def build_parser() -> argparse.ArgumentParser:
     t_scale.add_argument("--preset", choices=["lite", "standard", "heavy"], required=True)
     t_scale.add_argument("--cwd")
     t_scale.add_argument("--hard-downshift", action="store_true")
+    t_scale.add_argument("--budget-aware", action="store_true")
+    t_scale.add_argument("--dry-run", action="store_true")
+
+    # Phase D: team budget policy
+    t_bp = team_sp.add_parser("set-budget-policy")
+    t_bp.add_argument("--team-id", required=True)
+    t_bp.add_argument("--daily-cap-usd", type=float)
+    t_bp.add_argument("--model-policy", choices=["cost-optimized", "balanced", "capability-first"])
+    t_bp.add_argument("--auto-downshift", action="store_true")
+    t_bp.add_argument("--no-auto-downshift", action="store_true")
+    t_bp.add_argument("--warn-pct", type=float)
+    t_bp.add_argument("--crit-pct", type=float)
+    t_bp.add_argument("--preset-override", choices=["lite", "standard", "heavy"])
+
+    # Phase C: team announce
+    t_announce = team_sp.add_parser("announce")
+    t_announce.add_argument("--team-id", required=True)
+    t_announce.add_argument("--content", required=True)
+    t_announce.add_argument("--priority", choices=["low", "normal", "high", "urgent"], default="normal")
+    t_announce.add_argument("--sticky", action="store_true")
 
     # member
     member = sp.add_parser("member")
@@ -2816,6 +3698,7 @@ def build_parser() -> argparse.ArgumentParser:
     msg_send.add_argument("--priority", choices=["low", "normal", "high", "urgent"], default="normal")
     msg_send.add_argument("--message-id")
     msg_send.add_argument("--ttl-seconds", type=int, default=MESSAGE_TTL_SECONDS)
+    msg_send.add_argument("--thread-id", dest="thread_id")
     msg_send.add_argument("--reply-to-message-id")
 
     msg_bcast = msg_sp.add_parser("broadcast")
@@ -2824,6 +3707,7 @@ def build_parser() -> argparse.ArgumentParser:
     msg_bcast.add_argument("--content", required=True)
     msg_bcast.add_argument("--priority", choices=["low", "normal", "high", "urgent"], default="normal")
     msg_bcast.add_argument("--ttl-seconds", type=int, default=MESSAGE_TTL_SECONDS)
+    msg_bcast.add_argument("--thread-id", dest="thread_id")
     msg_bcast.add_argument("--exclude-member", dest="exclude_members", action="append")
     msg_bcast.add_argument("--include-lead", action="store_true")
     msg_bcast.add_argument("--announcement", action="store_true")
@@ -2839,6 +3723,17 @@ def build_parser() -> argparse.ArgumentParser:
     msg_ack.add_argument("--message-id", required=True)
     msg_ack.add_argument("--member-id", required=True)
 
+    # Phase C: new message subcommands
+    msg_thread = msg_sp.add_parser("thread")
+    msg_thread.add_argument("--team-id", required=True)
+    msg_thread.add_argument("--thread-id", dest="thread_id", required=True)
+
+    msg_receipts = msg_sp.add_parser("receipts")
+    msg_receipts.add_argument("--team-id", required=True)
+
+    msg_announcements = msg_sp.add_parser("announcements")
+    msg_announcements.add_argument("--team-id", required=True)
+
     # task
     task = sp.add_parser("task")
     task_sp = task.add_subparsers(dest="action", required=True)
@@ -2851,10 +3746,17 @@ def build_parser() -> argparse.ArgumentParser:
     task_add.add_argument("--file", dest="files", action="append")
     task_add.add_argument("--assignee")
     task_add.add_argument("--created-by")
+    task_add.add_argument("--priority", choices=["low", "normal", "high", "critical"], default="normal")
+    task_add.add_argument("--label", dest="labels", action="append")
+    task_add.add_argument("--estimate-minutes", dest="estimate_minutes", type=int)
+    task_add.add_argument("--due-at", dest="due_at")
+    task_add.add_argument("--sla-class", dest="sla_class", choices=["urgent", "normal", "relaxed"])
+    task_add.add_argument("--approval-required", dest="approval_required", action="store_true")
 
     task_list = task_sp.add_parser("list")
     task_list.add_argument("--team-id", required=True)
     task_list.add_argument("--status")
+    task_list.add_argument("--label")
 
     task_claim = task_sp.add_parser("claim")
     task_claim.add_argument("--team-id", required=True)
@@ -2869,12 +3771,60 @@ def build_parser() -> argparse.ArgumentParser:
     task_update.add_argument("--status", required=True)
     task_update.add_argument("--member-id")
     task_update.add_argument("--note")
+    task_update.add_argument("--priority", choices=["low", "normal", "high", "critical"])
+    task_update.add_argument("--add-label", dest="add_label", action="append")
+    task_update.add_argument("--remove-label", dest="remove_label", action="append")
+    task_update.add_argument("--estimate-minutes", dest="estimate_minutes", type=int)
+    task_update.add_argument("--due-at", dest="due_at")
+    task_update.add_argument("--sla-class", dest="sla_class", choices=["urgent", "normal", "relaxed"])
 
     task_release = task_sp.add_parser("release-claim")
     task_release.add_argument("--team-id", required=True)
     task_release.add_argument("--task-id", required=True)
     task_release.add_argument("--member-id")
     task_release.add_argument("--force", action="store_true")
+
+    # Phase C: new task subcommands
+    task_tmpl_list = task_sp.add_parser("template-list")
+    task_tmpl_list.add_argument("--team-id", required=True)
+
+    task_tmpl_apply = task_sp.add_parser("template-apply")
+    task_tmpl_apply.add_argument("--team-id", required=True)
+    task_tmpl_apply.add_argument("--template-name", dest="template_name", required=True)
+    task_tmpl_apply.add_argument("--prefix")
+    task_tmpl_apply.add_argument("--assignees")
+
+    task_graph = task_sp.add_parser("graph")
+    task_graph.add_argument("--team-id", required=True)
+    task_graph.add_argument("--format", choices=["text", "mermaid"], default="text")
+
+    task_rebalance = task_sp.add_parser("rebalance")
+    task_rebalance.add_argument("--team-id", required=True)
+    task_rebalance.add_argument("--force", action="store_true")
+
+    task_outcome = task_sp.add_parser("complete-with-outcome")
+    task_outcome.add_argument("--team-id", required=True)
+    task_outcome.add_argument("--task-id", required=True)
+    task_outcome.add_argument("--member-id")
+    task_outcome.add_argument("--files-touched", dest="files_touched")
+    task_outcome.add_argument("--tests-run", dest="tests_run")
+    task_outcome.add_argument("--risks")
+    task_outcome.add_argument("--follow-ups", dest="follow_ups")
+    task_outcome.add_argument("--note")
+
+    task_approve_cmd = task_sp.add_parser("approve")
+    task_approve_cmd.add_argument("--team-id", required=True)
+    task_approve_cmd.add_argument("--task-id", required=True)
+    task_approve_cmd.add_argument("--approved-by", dest="approved_by")
+
+    task_import_cmd = task_sp.add_parser("import")
+    task_import_cmd.add_argument("--team-id", required=True)
+    task_import_cmd.add_argument("--file", dest="file_path", required=True)
+    task_import_cmd.add_argument("--format", default="json")
+
+    task_export_cmd = task_sp.add_parser("export")
+    task_export_cmd.add_argument("--team-id", required=True)
+    task_export_cmd.add_argument("--format", default="json")
 
     # event
     event = sp.add_parser("event")
@@ -2979,6 +3929,10 @@ def dispatch(args: argparse.Namespace) -> str:
         return cmd_team_gc(args)
     if d == "team" and a == "scale-to-preset":
         return cmd_team_scale_to_preset(args)
+    if d == "team" and a == "set-budget-policy":
+        return cmd_team_set_budget_policy(args)
+    if d == "team" and a == "announce":
+        return cmd_team_announce(args)
     if d == "member" and a == "add":
         return cmd_member_add(args)
     if d == "member" and a == "attach-session":
@@ -2997,6 +3951,12 @@ def dispatch(args: argparse.Namespace) -> str:
         return cmd_message_inbox(args)
     if d == "message" and a == "ack":
         return cmd_message_ack(args)
+    if d == "message" and a == "thread":
+        return cmd_message_thread(args)
+    if d == "message" and a == "receipts":
+        return cmd_message_receipts_dashboard(args)
+    if d == "message" and a == "announcements":
+        return cmd_message_announcements(args)
     if d == "task" and a == "add":
         return cmd_task_add(args)
     if d == "task" and a == "list":
@@ -3007,6 +3967,22 @@ def dispatch(args: argparse.Namespace) -> str:
         return cmd_task_update(args)
     if d == "task" and a == "release-claim":
         return cmd_task_release_claim(args)
+    if d == "task" and a == "template-list":
+        return cmd_task_template_list(args)
+    if d == "task" and a == "template-apply":
+        return cmd_task_template_apply(args)
+    if d == "task" and a == "graph":
+        return cmd_task_graph(args)
+    if d == "task" and a == "rebalance":
+        return cmd_task_rebalance(args)
+    if d == "task" and a == "complete-with-outcome":
+        return cmd_task_complete_with_outcome(args)
+    if d == "task" and a == "approve":
+        return cmd_task_approve(args)
+    if d == "task" and a == "import":
+        return cmd_task_import(args)
+    if d == "task" and a == "export":
+        return cmd_task_export(args)
     if d == "event" and a == "check":
         return cmd_event_check(args)
     if d == "worker" and a == "register":

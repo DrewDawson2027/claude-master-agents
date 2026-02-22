@@ -410,6 +410,202 @@ async function runPipelineInBackground({ pipelineId, pipelineDir, directory, tas
   }
 }
 
+// ─── FORCE-WAKE HELPERS ─────────────────────────────────────────────────────
+
+/** Inject text into a TTY via AppleScript (iTerm2). Returns true if sent. */
+async function injectViaAppleScript(tty, message) {
+  if (!tty || PLATFORM !== "darwin") return false;
+  const escapedMessage = message.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n");
+  const termApp = getTerminalApp();
+  let appleScript;
+  if (termApp === "iTerm2") {
+    appleScript = `
+tell application "iTerm2"
+  set found to false
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        if tty of s is "${tty}" then
+          select t
+          tell s to write text "${escapedMessage}"
+          set found to true
+          exit repeat
+        end if
+      end repeat
+      if found then exit repeat
+    end repeat
+    if found then exit repeat
+  end repeat
+  return found
+end tell`.trim();
+  } else {
+    // Terminal.app — inject via System Events keystroke
+    appleScript = `
+tell application "Terminal"
+  set found to false
+  repeat with w in windows
+    repeat with t in tabs of w
+      try
+        if tty of t is "${tty}" then
+          set selected of t to true
+          set frontmost of w to true
+          set found to true
+          exit repeat
+        end if
+      end try
+    end repeat
+    if found then exit repeat
+  end repeat
+end tell
+delay 0.3
+if found then
+  tell application "System Events"
+    keystroke "${escapedMessage}"
+    keystroke return
+  end tell
+end if
+return found`.trim();
+  }
+  try {
+    const result = execSync(`osascript -e '${appleScript.replace(/'/g, "'\\''")}'`, { timeout: 8000, encoding: "utf-8" }).trim();
+    if (result !== "true") return false;
+    // Claude Code TUI requires an actual Return keystroke (not just a PTY newline) to submit
+    await new Promise(r => setTimeout(r, 300));
+    const returnKey = `
+tell application "iTerm2" to activate
+delay 0.2
+tell application "System Events"
+  key code 36
+end tell`.trim();
+    try { execSync(`osascript -e '${returnKey.replace(/'/g, "'\\''")}'`, { timeout: 5000 }); } catch {}
+    return true;
+  } catch { return false; }
+}
+
+/** Build a rich resume prompt from a frozen session's state. */
+function buildResumePrompt(session, instruction) {
+  let prompt = `RESUME TASK — previous session was frozen and killed.\n\n`;
+  prompt += `Tab: ${session.tab_name || "unknown"} | Branch: ${session.branch || "unknown"}\n`;
+  if (session.plan_file && existsSync(session.plan_file)) {
+    try {
+      const planLines = readFileSync(session.plan_file, "utf-8").split("\n").slice(0, 60).join("\n");
+      prompt += `\nPlan file (${session.plan_file}):\n${planLines}\n`;
+    } catch {}
+  }
+  if (session.files_touched?.length) {
+    prompt += `\nFiles already touched:\n${session.files_touched.join("\n")}\n`;
+  }
+  if (session.recent_ops?.length) {
+    const last = session.recent_ops.slice(-5);
+    prompt += `\nLast operations:\n${last.map(o => `  ${o.t || ""} ${o.tool || ""} ${o.file || ""}`).join("\n")}\n`;
+  }
+  prompt += `\nInstruction: ${instruction}\n`;
+  prompt += `\nContinue from where the previous session stopped. Check the plan file and files already touched to understand progress, then proceed.`;
+  return prompt;
+}
+
+/** Stage 3: SIGTERM the frozen session and spawn a fresh worker with context. */
+async function forceKillAndResume(session, sid, message, results) {
+  const pid = session.host_pid;
+  const resumePrompt = buildResumePrompt(session, message);
+
+  if (pid) {
+    try { process.kill(pid, "SIGTERM"); } catch {}
+    results.push(`  SIGTERMed pid ${pid}`);
+  }
+
+  // Mark session as closed
+  const sf = join(TERMINALS_DIR, `session-${sid}.json`);
+  const s = readJSON(sf) || {};
+  writeFileSync(sf, JSON.stringify({
+    ...s, status: "closed",
+    closed_at: new Date().toISOString(),
+    killed_by: "coord_force_wake",
+  }, null, 2));
+
+  await new Promise(r => setTimeout(r, 1000));
+
+  const cwd = session.cwd || process.env.HOME;
+  const tty = session.tty;
+
+  // Primary: inject `claude --resume` back into the SAME pane.
+  // The pane now has a shell prompt (process died) so write text works immediately.
+  let reinjected = false;
+  if (tty && PLATFORM === "darwin") {
+    const escapedCwd = cwd.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    const as = `
+tell application "iTerm2"
+  set found to false
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        if tty of s is "${tty}" then
+          select t
+          tell s to write text "cd \\"${escapedCwd}\\" && claude --resume"
+          set found to true
+          exit repeat
+        end if
+      end repeat
+      if found then exit repeat
+    end repeat
+    if found then exit repeat
+  end repeat
+  return found
+end tell`.trim();
+    try {
+      const r = execSync(`osascript -e '${as.replace(/'/g, "'\\''")}'`, { timeout: 8000, encoding: "utf-8" }).trim();
+      reinjected = r === "true";
+    } catch {}
+  }
+
+  if (reinjected) {
+    results.push(`  ✓ injected 'claude' into same pane (${tty})`);
+    // Wait for Claude to boot (~8-10s), then submit the resume task via System Events Return
+    await new Promise(r => setTimeout(r, 10000));
+    const taskSubmitted = await injectViaAppleScript(tty, resumePrompt.slice(0, 600));
+    results.push(`  task submitted: ${taskSubmitted ? "yes — running autonomously" : "failed (will see inbox on first tool call)"}`);
+    return (
+      `Session ${sid} (${session.tab_name || sid}) restarted in-place.\n\n` +
+      `${results.join("\n")}`
+    );
+  }
+
+  // Fallback: background worker (TTY gone or AppleScript failed)
+  results.push(`  pane reinject failed — falling back to background worker`);
+  const taskId = `FW${Date.now()}`;
+  const resultFile = join(RESULTS_DIR, `${taskId}.txt`);
+  const pidFile = join(RESULTS_DIR, `${taskId}.pid`);
+  const metaFile = join(RESULTS_DIR, `${taskId}.meta.json`);
+  const promptFile = join(RESULTS_DIR, `${taskId}.prompt`);
+  const meta = { task_id: taskId, directory: cwd, prompt: resumePrompt.slice(0, 500), model: "sonnet", spawned: new Date().toISOString(), status: "running", resumed_from: sid };
+  writeFileSync(metaFile, JSON.stringify(meta, null, 2));
+  writeFileSync(promptFile, resumePrompt);
+  appendFileSync(resultFile, `Force-wake worker ${taskId} starting at ${new Date().toISOString()}\n`);
+  try {
+    const child = runClaudeDetached({ cwd, promptFile, outputFile: resultFile, model: "sonnet", agent: null,
+      onExit: (code) => {
+        const status = code === 0 ? "completed" : "failed";
+        writeFileSync(`${metaFile}.done`, JSON.stringify({ status, task_id: taskId, exit_code: code, finished: new Date().toISOString() }, null, 2));
+        try { unlinkSync(pidFile); } catch {}
+        writeFileSync(metaFile, JSON.stringify({ ...meta, status, finished: new Date().toISOString() }, null, 2));
+      },
+    });
+    if (child.pid) writeFileSync(pidFile, String(child.pid));
+    results.push(`  background worker: ${taskId} (pid ${child.pid})`);
+  } catch (err) {
+    results.push(`  spawn failed: ${err.message}`);
+  }
+
+  return (
+    `Session ${sid} (${session.tab_name || sid}) was SIGTERM'd.\n` +
+    `Pane reinject failed — background worker spawned as fallback.\n\n` +
+    `${results.join("\n")}\n\n` +
+    `Check worker: coord_get_result task_id="${taskId}"`
+  );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+
 function getAllSessions() {
   try {
     return readdirSync(TERMINALS_DIR)
@@ -622,8 +818,32 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "coord_resolve_session",
+      description: "Resolve a session by iTerm2 tab name (fuzzy, case-insensitive). Returns session ID, TTY, and status. Use this when the user refers to a session by name instead of ID (e.g. 'master agent', 'token plan').",
+      inputSchema: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Full or partial iTerm2 tab name, e.g. 'master agent'" },
+        },
+        required: ["name"],
+      },
+    },
+    {
+      name: "coord_force_wake",
+      description: "Forcibly unfreeze a stuck/frozen session. 3-stage escalation: (1) SIGINT + inject message, (2) kill hung MCP children + SIGINT + retry, (3) SIGTERM + spawn fresh worker with extracted task context. Use when coord_wake_session fails or session is mid-API call.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          session_id: { type: "string", description: "Target session ID (8 chars) or partial tab name (e.g. 'master agent')" },
+          message: { type: "string", description: "Message/instruction to inject after unfreezing. Default: 'Lead: check inbox and continue your task.'" },
+          force_kill: { type: "boolean", description: "Skip stages 1-2 and go straight to SIGTERM + fresh spawn. Use when you know the session is completely dead." },
+        },
+        required: ["session_id"],
+      },
+    },
+    {
       name: "coord_wake_session",
-      description: "Wake an idle session. macOS: AppleScript injection via iTerm2/Terminal.app. Windows/Linux: falls back to inbox message with notification.",
+      description: "Wake an idle session. macOS: AppleScript injection via iTerm2/Terminal.app. Windows/Linux: falls back to inbox message with notification. session_id can be a full ID or use coord_resolve_session to look up by tab name first.",
       inputSchema: {
         type: "object",
         properties: {
@@ -829,7 +1049,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "coord_team_add_task",
-      description: "Add a team task with dependency list and file scope.",
+      description: "Add a team task with dependency list, file scope, priority, labels, estimates, and approval gate.",
       inputSchema: {
         type: "object",
         properties: {
@@ -841,18 +1061,25 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           files: { type: "array", items: { type: "string" } },
           assignee: { type: "string" },
           created_by: { type: "string" },
+          priority: { type: "string", enum: ["low", "normal", "high", "critical"], description: "Task priority (default: normal)" },
+          labels: { type: "array", items: { type: "string" }, description: "Task labels/tags" },
+          estimate_minutes: { type: "number", description: "Estimated time in minutes" },
+          due_at: { type: "string", description: "Due date/time (ISO format)" },
+          sla_class: { type: "string", enum: ["urgent", "normal", "relaxed"], description: "SLA classification" },
+          approval_required: { type: "boolean", description: "Require lead approval before in_progress" },
         },
         required: ["team_id", "title"],
       },
     },
     {
       name: "coord_team_list_tasks",
-      description: "List team tasks and claim/dependency state.",
+      description: "List team tasks sorted by priority with labels, claims, and dependency state.",
       inputSchema: {
         type: "object",
         properties: {
           team_id: { type: "string" },
           status: { type: "string" },
+          label: { type: "string", description: "Filter by label" },
         },
         required: ["team_id"],
       },
@@ -873,15 +1100,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "coord_team_update_task",
-      description: "Update task status and emit TaskCompleted events when completed.",
+      description: "Update task status, priority, labels, estimates. Approval gate intercepts in_progress for approval-required tasks.",
       inputSchema: {
         type: "object",
         properties: {
           team_id: { type: "string" },
           task_id: { type: "string" },
-          status: { type: "string", enum: ["pending", "blocked", "claimed", "in_progress", "completed", "cancelled"] },
+          status: { type: "string", enum: ["pending", "blocked", "claimed", "in_progress", "completed", "cancelled", "awaiting_approval"] },
           member_id: { type: "string" },
           note: { type: "string" },
+          priority: { type: "string", enum: ["low", "normal", "high", "critical"] },
+          add_labels: { type: "array", items: { type: "string" } },
+          remove_labels: { type: "array", items: { type: "string" } },
+          estimate_minutes: { type: "number" },
+          due_at: { type: "string" },
+          sla_class: { type: "string", enum: ["urgent", "normal", "relaxed"] },
         },
         required: ["team_id", "task_id", "status"],
       },
@@ -1122,6 +1355,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           preset: { type: "string", enum: ["lite", "standard", "heavy"] },
           cwd: { type: "string" },
           hard_downshift: { type: "boolean" },
+          budget_aware: { type: "boolean", description: "Override preset from budget recommendation" },
+          dry_run: { type: "boolean", description: "Show what would happen without executing" },
         },
         required: ["team_id", "preset"],
       },
@@ -1156,6 +1391,157 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           reply_to_message_id: { type: "string" },
         },
         required: ["team_id", "from_member", "content"],
+      },
+    },
+    // ─── Phase C: Communication + Task Semantics ───
+    {
+      name: "coord_team_announce",
+      description: "Broadcast an announcement to all team members. Supports sticky announcements that persist until acknowledged.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+          content: { type: "string", description: "Announcement message" },
+          priority: { type: "string", enum: ["low", "normal", "high", "urgent"], description: "Announcement priority (default: normal)" },
+          sticky: { type: "boolean", description: "If true, repeats in every inbox read until acked" },
+        },
+        required: ["team_id", "content"],
+      },
+    },
+    {
+      name: "coord_team_announcements",
+      description: "List all team announcements with per-member ack status.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+        },
+        required: ["team_id"],
+      },
+    },
+    {
+      name: "coord_team_message_thread",
+      description: "Retrieve all messages in a thread, chronologically with summary.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+          thread_id: { type: "string", description: "Thread ID to retrieve" },
+        },
+        required: ["team_id", "thread_id"],
+      },
+    },
+    {
+      name: "coord_team_message_receipts",
+      description: "Delivery receipts dashboard: queue depth, ack latency percentiles, retry histogram, stale-by-member breakdown.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+        },
+        required: ["team_id"],
+      },
+    },
+    {
+      name: "coord_team_task_template_list",
+      description: "List available task templates (built-in and team-custom).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+        },
+        required: ["team_id"],
+      },
+    },
+    {
+      name: "coord_team_task_template_apply",
+      description: "Create a set of tasks from a template with prefix and optional assignees.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+          template_name: { type: "string", description: "Template name, e.g. build-review-test-docs" },
+          prefix: { type: "string", description: "Prefix for task IDs (defaults to template name)" },
+          assignees: { type: "array", items: { type: "string" }, description: "Member IDs to round-robin assign tasks to" },
+        },
+        required: ["team_id", "template_name"],
+      },
+    },
+    {
+      name: "coord_team_task_graph",
+      description: "Generate a dependency graph of team tasks as ASCII or Mermaid flowchart.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+          format: { type: "string", enum: ["text", "mermaid"], description: "Output format (default: text)" },
+        },
+        required: ["team_id"],
+      },
+    },
+    {
+      name: "coord_team_task_rebalance",
+      description: "Auto-reassign pending/stalled tasks to underloaded members based on workload caps.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+          force: { type: "boolean", description: "Reassign even claimed tasks" },
+        },
+        required: ["team_id"],
+      },
+    },
+    {
+      name: "coord_team_task_complete",
+      description: "Complete a task with structured outcome: summary, artifacts, next steps.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+          task_id: { type: "string" },
+          member_id: { type: "string" },
+          summary: { type: "string", description: "What was accomplished" },
+          artifacts: { type: "array", items: { type: "string" }, description: "Files or outputs produced" },
+          next_steps: { type: "array", items: { type: "string" }, description: "Recommended follow-up tasks" },
+        },
+        required: ["team_id", "task_id"],
+      },
+    },
+    {
+      name: "coord_team_task_approve",
+      description: "Approve a task that requires lead approval before work begins.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+          task_id: { type: "string" },
+          approved_by: { type: "string", description: "Approver ID (defaults to lead)" },
+        },
+        required: ["team_id", "task_id"],
+      },
+    },
+    {
+      name: "coord_team_task_import",
+      description: "Bulk import tasks from a JSON file.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+          file: { type: "string", description: "Path to JSON file containing task array" },
+        },
+        required: ["team_id", "file"],
+      },
+    },
+    {
+      name: "coord_team_task_export",
+      description: "Export all team tasks to a JSON file.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+          file: { type: "string", description: "Output file path" },
+        },
+        required: ["team_id", "file"],
       },
     },
     {
@@ -1381,6 +1767,232 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["format"],
       },
     },
+
+    // --- Phase D: Cost Intelligence + Live Budget Control ---
+    {
+      name: "coord_team_set_budget_policy",
+      description: "Set per-team budget policy: daily cap, model policy, auto-downshift, thresholds.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+          daily_cap_usd: { type: "number", description: "Daily budget cap in USD" },
+          model_policy: { type: "string", enum: ["cost-optimized", "balanced", "capability-first"] },
+          auto_downshift: { type: "boolean", description: "Auto-scale to lite on critical budget" },
+          warn_pct: { type: "number", description: "Warning threshold percentage" },
+          crit_pct: { type: "number", description: "Critical threshold percentage" },
+          preset_override: { type: "string", enum: ["lite", "standard", "heavy"], description: "Force preset regardless of budget" },
+        },
+        required: ["team_id"],
+      },
+    },
+    {
+      name: "coord_cost_burn_rate_check",
+      description: "Check burn-rate projection and alert if budget will be exceeded.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+          project: { type: "string" },
+          json: { type: "boolean" },
+        },
+      },
+    },
+    {
+      name: "coord_cost_anomaly_check",
+      description: "Detect cost/token/message anomalies by comparing current vs baseline.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+          sensitivity: { type: "number", description: "Multiplier threshold for anomaly detection (default: 2.0)" },
+          json: { type: "boolean" },
+        },
+      },
+    },
+    {
+      name: "coord_cost_spend_leaderboard",
+      description: "Ranked spend breakdown by session, team, or model.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          window: { type: "string", enum: ["today", "week", "month"] },
+          group_by: { type: "string", enum: ["session", "team", "model"] },
+          limit: { type: "number", description: "Max entries to return (default: 10)" },
+          json: { type: "boolean" },
+        },
+      },
+    },
+    {
+      name: "coord_cost_daily_report",
+      description: "Generate daily cost report with budget status, burn-rate, anomalies, and recommendations.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          window: { type: "string", enum: ["today", "week", "month"] },
+          team_id: { type: "string" },
+          auto: { type: "boolean", description: "Headless mode for cron/LaunchAgent" },
+          json: { type: "boolean" },
+        },
+      },
+    },
+    {
+      name: "coord_cost_trends",
+      description: "Cost trend analysis: daily series, moving averages, week-over-week change.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          period: { type: "string", enum: ["week", "month"] },
+          format: { type: "string", enum: ["json", "md"] },
+          json: { type: "boolean" },
+        },
+      },
+    },
+
+    // --- Phase F: Observability tools ---
+    {
+      name: "coord_obs_health_report",
+      description: "Generate unified health dashboard: runtime + tasks + events + cost + budgets + alerts + parity grades.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          json: { type: "boolean", description: "Return JSON instead of markdown" },
+        },
+      },
+    },
+    {
+      name: "coord_obs_timeline",
+      description: "Generate chronological team timeline (tasks, messages, events).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string", description: "Team ID" },
+          hours: { type: "number", description: "Hours to look back (default 24)" },
+          json: { type: "boolean", description: "Return JSON" },
+        },
+        required: ["team_id"],
+      },
+    },
+    {
+      name: "coord_obs_slo",
+      description: "Show SLO metrics report (ack latency, recovery time, task completion, restart/failure rates).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          json: { type: "boolean", description: "Return JSON" },
+        },
+      },
+    },
+    {
+      name: "coord_obs_slo_snapshot",
+      description: "Record an SLO metrics snapshot to history.",
+      inputSchema: { type: "object", properties: {} },
+    },
+    {
+      name: "coord_obs_parity_history",
+      description: "Show parity grade trend over time.",
+      inputSchema: { type: "object", properties: {} },
+    },
+    {
+      name: "coord_obs_audit_trail",
+      description: "Export audit trail of sensitive operations (recoveries, force claims, interrupts, replacements).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          hours: { type: "number", description: "Hours to look back (default 168 = 7 days)" },
+          json: { type: "boolean", description: "Return JSON" },
+        },
+      },
+    },
+
+    // --- Phase F: Governance / Policy tools ---
+    {
+      name: "coord_policy_lint",
+      description: "Validate all governance, cost, and team policy configs.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          json: { type: "boolean", description: "Return JSON" },
+        },
+      },
+    },
+    {
+      name: "coord_policy_check_action",
+      description: "Check if an action is allowed by team policy (deploy, prod_push, force_push, destructive_delete).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          action: { type: "string", description: "Action to check" },
+          team_id: { type: "string", description: "Team ID" },
+        },
+        required: ["action"],
+      },
+    },
+    {
+      name: "coord_policy_check_tools",
+      description: "Check if a tool or model is allowed by team policy.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string", description: "Team ID" },
+          tool: { type: "string", description: "Tool or model name to check" },
+        },
+        required: ["team_id", "tool"],
+      },
+    },
+    {
+      name: "coord_policy_redact",
+      description: "Redact sensitive content (paths, secrets, or both) from a file.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          input: { type: "string", description: "Input file path" },
+          mode: { type: "string", enum: ["paths", "secrets", "full"], description: "Redaction mode (default: full)" },
+          output: { type: "string", description: "Output file path (default: stdout)" },
+        },
+        required: ["input"],
+      },
+    },
+    {
+      name: "coord_policy_sign",
+      description: "Sign a file with SHA-256 checksum for integrity verification.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          file: { type: "string", description: "File path to sign" },
+        },
+        required: ["file"],
+      },
+    },
+    {
+      name: "coord_policy_verify",
+      description: "Verify a signed file's integrity.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          file: { type: "string", description: "File path to verify" },
+        },
+        required: ["file"],
+      },
+    },
+
+    // --- Phase I: Collaboration tools ---
+    { name: "coord_collab_set_role", description: "Set operator role (lead/operator/viewer) for a team member.", inputSchema: { type: "object", properties: { team_id: { type: "string" }, member: { type: "string" }, role: { type: "string", enum: ["lead", "operator", "viewer"] } }, required: ["team_id", "member", "role"] } },
+    { name: "coord_collab_check_permission", description: "Check if an action is permitted for a member's role.", inputSchema: { type: "object", properties: { team_id: { type: "string" }, member: { type: "string" }, action: { type: "string" } }, required: ["team_id", "member", "action"] } },
+    { name: "coord_collab_handoff_create", description: "Create handoff snapshot for operator transitions.", inputSchema: { type: "object", properties: { team_id: { type: "string" }, from: { type: "string" }, note: { type: "string" } }, required: ["team_id"] } },
+    { name: "coord_collab_handoff_latest", description: "Show what changed since last handoff.", inputSchema: { type: "object", properties: { team_id: { type: "string" } }, required: ["team_id"] } },
+    { name: "coord_collab_set_ownership", description: "Set team ownership metadata (owners, escalation, project).", inputSchema: { type: "object", properties: { team_id: { type: "string" }, owners: { type: "string" }, escalation: { type: "string" }, project: { type: "string" } }, required: ["team_id"] } },
+    { name: "coord_collab_set_presence", description: "Set operator presence (available/busy/away/offline).", inputSchema: { type: "object", properties: { team_id: { type: "string" }, member: { type: "string" }, status: { type: "string", enum: ["available", "busy", "away", "offline"] } }, required: ["team_id", "member", "status"] } },
+    { name: "coord_collab_who", description: "List operators with presence, roles, and activity.", inputSchema: { type: "object", properties: { team_id: { type: "string" } }, required: ["team_id"] } },
+    { name: "coord_collab_comment", description: "Add comment/annotation to a task, event, or message.", inputSchema: { type: "object", properties: { team_id: { type: "string" }, target: { type: "string" }, text: { type: "string" }, author: { type: "string" } }, required: ["team_id", "target", "text", "author"] } },
+    { name: "coord_collab_comments", description: "List comments, optionally filtered by target.", inputSchema: { type: "object", properties: { team_id: { type: "string" }, target: { type: "string" } }, required: ["team_id"] } },
+
+    // --- Phase I: Smart Automation tools ---
+    { name: "coord_auto_recommend_preset", description: "Recommend team preset based on budget, repo, and task type.", inputSchema: { type: "object", properties: { team_id: { type: "string" }, budget: { type: "number" }, task_type: { type: "string" }, repo: { type: "string" } } } },
+    { name: "coord_auto_decompose", description: "Decompose goal into task graph for approval.", inputSchema: { type: "object", properties: { team_id: { type: "string" }, goal: { type: "string" }, template: { type: "string" }, dry_run: { type: "boolean" }, apply: { type: "boolean" } }, required: ["goal"] } },
+    { name: "coord_auto_recover", description: "Auto-recover: doctor + SLO check + conditional recover-hard.", inputSchema: { type: "object", properties: { team_id: { type: "string" }, all: { type: "boolean" } } } },
+    { name: "coord_auto_scale", description: "Auto-scale by queue depth, budget pressure, and SLO.", inputSchema: { type: "object", properties: { team_id: { type: "string" }, dry_run: { type: "boolean" } }, required: ["team_id"] } },
+    { name: "coord_auto_weekly_optimize", description: "Weekly optimization recommendations.", inputSchema: { type: "object", properties: { team_id: { type: "string" }, all: { type: "boolean" } } } },
   ],
 }));
 
@@ -1413,10 +2025,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const tools = `${tc.Write || 0}/${tc.Edit || 0}/${tc.Bash || 0}/${tc.Read || 0}`;
         const recentFiles = (s.files_touched || []).slice(-3).map(f => basename(f)).join(", ") || "—";
         const lastOp = s.recent_ops?.length ? `${s.recent_ops[s.recent_ops.length - 1].tool} ${basename(s.recent_ops[s.recent_ops.length - 1].file || "")}` : "—";
-        return `| ${s.session} | ${s.tty || "?"} | ${s.project || "?"} | ${status} | ${lastActive} | ${tools} | ${recentFiles} | ${lastOp} |`;
+        const tabName = s.tab_name ? s.tab_name.replace(/\s*\(node\)\s*$/i, "") : "—";
+        return `| ${tabName} | ${s.session} | ${s.tty || "?"} | ${status} | ${lastActive} | ${tools} | ${recentFiles} | ${lastOp} |`;
       });
 
-      const table = `| Session | TTY | Project | Status | Last Active | W/E/B/R | Recent Files | Last Op |\n|---------|-----|---------|--------|-------------|---------|--------------|---------|` + "\n" + rows.join("\n");
+      const table = `| Tab Name | Session | TTY | Status | Last Active | W/E/B/R | Recent Files | Last Op |\n|----------|---------|-----|--------|-------------|---------|--------------|---------|` + "\n" + rows.join("\n");
       return text(`## Sessions (${filtered.length}) — Platform: ${PLATFORM}\n\n${table}`);
     }
 
@@ -1431,6 +2044,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       output += `- **Branch:** ${session.branch}\n- **CWD:** ${session.cwd}\n`;
       output += `- **Status:** ${getSessionStatus(session)}\n`;
       output += `- **TTY:** ${session.tty || "unknown"}\n`;
+      output += `- **Tab Name:** ${session.tab_name || "unknown"}\n`;
       output += `- **Started:** ${session.started}\n- **Last Active:** ${timeAgo(session.last_active)}\n`;
       output += `- **Task:** ${session.current_task || "not declared"}\n`;
 
@@ -1762,6 +2376,106 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return text(result);
     }
 
+    // ─── RESOLVE SESSION BY TAB NAME ───
+    case "coord_resolve_session": {
+      const query = String(args.name ?? "").toLowerCase();
+      const sessions = getAllSessions().filter(s => s.status !== "closed");
+      const match = sessions.find(s =>
+        (s.tab_name || "").toLowerCase().includes(query) ||
+        (s.session || "").toLowerCase().startsWith(query)
+      );
+      if (!match) {
+        const names = sessions.map(s => s.tab_name ? `"${s.tab_name.replace(/\s*\(node\)\s*$/i, "")}" (${s.session})` : s.session).join(", ");
+        return text(`No session found matching "${args.name}".\nAvailable: ${names}`);
+      }
+      return text(
+        `Resolved "${args.name}" → session **${match.session}**\n` +
+        `- Tab: ${match.tab_name || "unknown"}\n` +
+        `- TTY: ${match.tty || "?"}\n` +
+        `- Status: ${getSessionStatus(match)}\n` +
+        `- Last active: ${timeAgo(match.last_active)}`
+      );
+    }
+
+    // ─── FORCE WAKE (3-stage escalation) ───
+    case "coord_force_wake": {
+      // Resolve by tab name or partial ID
+      let sid = String(args.session_id ?? "");
+      const sessions = getAllSessions();
+      const byName = sessions.find(s =>
+        (s.tab_name || "").toLowerCase().includes(sid.toLowerCase()) ||
+        (s.session || "").startsWith(sid)
+      );
+      if (byName) sid = byName.session;
+
+      const sessionFile = join(TERMINALS_DIR, `session-${sid}.json`);
+      const session = readJSON(sessionFile);
+      if (!session) return text(`Session ${sid} not found. Try coord_list_sessions to get the right ID or tab name.`);
+
+      const pid = session.host_pid;
+      const tty = session.tty;
+      const message = String(args.message ?? "Lead: check inbox and continue your task.");
+      const results = [];
+
+      // Stage 3 shortcut: force_kill=true
+      if (args.force_kill) {
+        results.push("force_kill=true — skipping stages 1-2");
+        return text(await forceKillAndResume(session, sid, message, results));
+      }
+
+      // ── Stage 1: SIGINT + inject ──
+      results.push("Stage 1: SIGINT + inject");
+      if (pid) {
+        try { process.kill(pid, "SIGINT"); results.push("  SIGINT sent"); } catch (e) { results.push(`  SIGINT failed: ${e.message}`); }
+        await new Promise(r => setTimeout(r, 2000));
+      } else {
+        results.push("  no host_pid — skipping SIGINT");
+      }
+
+      const injected1 = await injectViaAppleScript(tty, message);
+      results.push(`  inject: ${injected1 ? "sent" : "failed"}`);
+
+      // Wait up to 12s for last_active to change
+      const before = session.last_active;
+      for (let i = 0; i < 6; i++) {
+        await new Promise(r => setTimeout(r, 2000));
+        const updated = readJSON(sessionFile);
+        if (updated?.last_active !== before) {
+          return text(`✓ Session ${sid} responded after Stage 1.\n\n${results.join("\n")}`);
+        }
+      }
+      results.push("  no response after 12s — escalating");
+
+      // ── Stage 2: Kill MCP children + SIGINT + inject ──
+      results.push("Stage 2: kill MCP children + SIGINT + inject");
+      if (pid) {
+        try {
+          const children = execSync(`pgrep -P ${pid}`, { encoding: "utf8" }).trim().split("\n").filter(Boolean);
+          children.forEach(cpid => { try { process.kill(parseInt(cpid), "SIGTERM"); } catch {} });
+          results.push(`  killed ${children.length} child process(es)`);
+        } catch { results.push("  no child processes found"); }
+        await new Promise(r => setTimeout(r, 1000));
+        try { process.kill(pid, "SIGINT"); results.push("  SIGINT sent"); } catch (e) { results.push(`  SIGINT failed: ${e.message}`); }
+        await new Promise(r => setTimeout(r, 2000));
+      }
+
+      const injected2 = await injectViaAppleScript(tty, message);
+      results.push(`  inject: ${injected2 ? "sent" : "failed"}`);
+
+      for (let i = 0; i < 5; i++) {
+        await new Promise(r => setTimeout(r, 2000));
+        const updated = readJSON(sessionFile);
+        if (updated?.last_active !== before) {
+          return text(`✓ Session ${sid} responded after Stage 2.\n\n${results.join("\n")}`);
+        }
+      }
+      results.push("  no response after 10s — escalating to Stage 3");
+
+      // ── Stage 3: SIGTERM + fresh spawn ──
+      results.push("Stage 3: SIGTERM + fresh spawn");
+      return text(await forceKillAndResume(session, sid, message, results));
+    }
+
     // ─── WAKE SESSION (cross-platform) ───
     case "coord_wake_session": {
       const session_id = validateSafeId(args.session_id, "session_id");
@@ -1770,6 +2484,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!existsSync(sessionFile)) return text(`Session ${session_id} not found.`);
       const sessionData = readJSON(sessionFile);
       const targetTTY = sessionData?.tty;
+
+      // Interrupt any pending operation so the session reaches the readline prompt
+      if (sessionData?.host_pid) {
+        try { process.kill(sessionData.host_pid, "SIGINT"); } catch {}
+        await new Promise(r => setTimeout(r, 1500));
+      }
 
       // On non-macOS, fall back to inbox messaging (universal)
       if (PLATFORM !== "darwin") {
@@ -1786,105 +2506,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         );
       }
 
-      // macOS: AppleScript injection
-      try {
-        const escapedMessage = message.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n");
-        const termApp = getTerminalApp();
-        let appleScript;
-
-        if (termApp === "iTerm2" && targetTTY) {
-          appleScript = `
-tell application "iTerm2"
-  set found to false
-  repeat with w in windows
-    repeat with t in tabs of w
-      repeat with s in sessions of t
-        if tty of s is "${targetTTY}" then
-          select t
-          tell s to write text "${escapedMessage}" newline NO
-          delay 0.3
-          tell s to write text ""
-          set found to true
-          exit repeat
-        end if
-      end repeat
-      if found then exit repeat
-    end repeat
-    if found then exit repeat
-  end repeat
-  return found
-end tell`.trim();
-        } else if (termApp === "iTerm2") {
-          appleScript = `
-tell application "iTerm2"
-  set found to false
-  repeat with w in windows
-    repeat with t in tabs of w
-      repeat with s in sessions of t
-        if name of s contains "claude-${session_id}" then
-          select t
-          tell s to write text "${escapedMessage}" newline NO
-          delay 0.3
-          tell s to write text ""
-          set found to true
-          exit repeat
-        end if
-      end repeat
-      if found then exit repeat
-    end repeat
-    if found then exit repeat
-  end repeat
-  return found
-end tell`.trim();
-        } else {
-          appleScript = `
-tell application "Terminal"
-  set found to false
-  repeat with w in windows
-    repeat with t in tabs of w
-      if name of t contains "claude-${session_id}" then
-        set selected of t to true
-        set frontmost of w to true
-        set found to true
-        exit repeat
-      end if
-    end repeat
-    if found then exit repeat
-  end repeat
-end tell
-delay 0.5
-if found then
-  tell application "System Events"
-    keystroke "${escapedMessage}"
-    keystroke return
-  end tell
-end if
-return found`.trim();
-        }
-
-        const result = execSync(`osascript -e '${appleScript.replace(/'/g, "'\\''")}'`, { timeout: 10000, encoding: "utf-8" }).trim();
-
-        if (result === "true") {
-          return text(`Woke ${session_id} via ${termApp}${targetTTY ? ` (${targetTTY})` : ""}.\nMessage: "${message}"`);
-        }
-
-        // AppleScript couldn't find it — fall back to inbox
-        const inboxFile = join(INBOX_DIR, `${session_id}.jsonl`);
-        appendFileSync(inboxFile, JSON.stringify({
-          ts: new Date().toISOString(), from: "lead", priority: "urgent",
-          content: `[WAKE] ${message}`,
-        }) + "\n");
-        return text(`Could not find session in ${termApp}. Sent inbox message as fallback.\nUse coord_spawn_worker if session is truly dead.`);
-
-      } catch (err) {
-        // Error — fall back to inbox
-        const inboxFile = join(INBOX_DIR, `${session_id}.jsonl`);
-        appendFileSync(inboxFile, JSON.stringify({
-          ts: new Date().toISOString(), from: "lead", priority: "urgent",
-          content: `[WAKE] ${message}`,
-        }) + "\n");
-        return text(`AppleScript failed: ${err.message}\nSent inbox message as fallback.`);
+      // macOS: injectViaAppleScript — write text + System Events key code 36 (actual Return)
+      const injected = await injectViaAppleScript(targetTTY, message);
+      if (injected) {
+        return text(`Woke ${session_id} (${targetTTY || "unknown TTY"}).\nMessage sent and submitted.`);
       }
+
+      // Pane not found — inbox fallback
+      const inboxFile = join(INBOX_DIR, `${session_id}.jsonl`);
+      appendFileSync(inboxFile, JSON.stringify({
+        ts: new Date().toISOString(), from: "lead", priority: "urgent",
+        content: `[WAKE] ${message}`,
+      }) + "\n");
+      return text(`Could not find session pane. Sent inbox message as fallback.\nUse coord_force_wake if session is frozen.`);
     }
 
     // ─── KILL WORKER (cross-platform) ───
@@ -2316,6 +2950,8 @@ return found`.trim();
       ];
       if (args?.cwd) argv.push("--cwd", String(args.cwd));
       if (args?.hard_downshift) argv.push("--hard-downshift");
+      if (args?.budget_aware) argv.push("--budget-aware");
+      if (args?.dry_run) argv.push("--dry-run");
       return text(runTeamRuntime(argv));
     }
 
@@ -2344,6 +2980,61 @@ return found`.trim();
       if (args?.announcement) argv.push("--announcement");
       if (args?.reply_to_message_id) argv.push("--reply-to-message-id", validateSafeId(args.reply_to_message_id, "reply_to_message_id"));
       return text(runTeamRuntime(argv));
+    }
+
+    // ─── Phase C: Communication + Task Semantics ───
+    case "coord_team_announce": {
+      const argv = ["team", "announce", "--team-id", String(args.team_id), "--content", String(args.content)];
+      if (args.priority) argv.push("--priority", args.priority);
+      if (args.sticky) argv.push("--sticky");
+      return text(runTeamRuntime(argv));
+    }
+    case "coord_team_announcements": {
+      return text(runTeamRuntime(["message", "announcements", "--team-id", String(args.team_id)]));
+    }
+    case "coord_team_message_thread": {
+      return text(runTeamRuntime(["message", "thread", "--team-id", String(args.team_id), "--thread-id", String(args.thread_id)]));
+    }
+    case "coord_team_message_receipts": {
+      return text(runTeamRuntime(["message", "receipts", "--team-id", String(args.team_id)]));
+    }
+    case "coord_team_task_template_list": {
+      return text(runTeamRuntime(["task", "template-list", "--team-id", String(args.team_id)]));
+    }
+    case "coord_team_task_template_apply": {
+      const argv = ["task", "template-apply", "--team-id", String(args.team_id), "--template-name", String(args.template_name)];
+      if (args.prefix) argv.push("--prefix", args.prefix);
+      if (args.assignees?.length) argv.push("--assignees", ...args.assignees);
+      return text(runTeamRuntime(argv));
+    }
+    case "coord_team_task_graph": {
+      const argv = ["task", "graph", "--team-id", String(args.team_id)];
+      if (args.format) argv.push("--format", args.format);
+      return text(runTeamRuntime(argv));
+    }
+    case "coord_team_task_rebalance": {
+      const argv = ["task", "rebalance", "--team-id", String(args.team_id)];
+      if (args.force) argv.push("--force");
+      return text(runTeamRuntime(argv));
+    }
+    case "coord_team_task_complete": {
+      const argv = ["task", "complete-with-outcome", "--team-id", String(args.team_id), "--task-id", String(args.task_id)];
+      if (args.member_id) argv.push("--member-id", args.member_id);
+      if (args.summary) argv.push("--summary", args.summary);
+      if (args.artifacts?.length) argv.push("--artifacts", ...args.artifacts);
+      if (args.next_steps?.length) argv.push("--next-steps", ...args.next_steps);
+      return text(runTeamRuntime(argv));
+    }
+    case "coord_team_task_approve": {
+      const argv = ["task", "approve", "--team-id", String(args.team_id), "--task-id", String(args.task_id)];
+      if (args.approved_by) argv.push("--approved-by", args.approved_by);
+      return text(runTeamRuntime(argv));
+    }
+    case "coord_team_task_import": {
+      return text(runTeamRuntime(["task", "import", "--team-id", String(args.team_id), "--file", String(args.file)]));
+    }
+    case "coord_team_task_export": {
+      return text(runTeamRuntime(["task", "export", "--team-id", String(args.team_id), "--file", String(args.file)]));
     }
 
     case "coord_team_release_claim": {
@@ -2498,6 +3189,191 @@ return found`.trim();
       if (args?.session_id) argv.push("--session-id", validateSafeId(args.session_id, "session_id"));
       if (args?.project) argv.push("--project", String(args.project));
       return text(runCostRuntime(argv));
+    }
+
+    // --- Phase D: Cost Intelligence + Live Budget Control handlers ---
+    case "coord_team_set_budget_policy": {
+      const argv = ["team", "set-budget-policy", "--team-id", validateSafeId(args.team_id, "team_id")];
+      if (args?.daily_cap_usd != null) argv.push("--daily-cap-usd", String(args.daily_cap_usd));
+      if (args?.model_policy) argv.push("--model-policy", String(args.model_policy));
+      if (args?.auto_downshift === true) argv.push("--auto-downshift");
+      if (args?.auto_downshift === false) argv.push("--no-auto-downshift");
+      if (args?.warn_pct != null) argv.push("--warn-pct", String(args.warn_pct));
+      if (args?.crit_pct != null) argv.push("--crit-pct", String(args.crit_pct));
+      if (args?.preset_override) argv.push("--preset-override", String(args.preset_override));
+      return text(runTeamRuntime(argv));
+    }
+    case "coord_cost_burn_rate_check": {
+      const argv = ["burn-rate-check"];
+      if (args?.team_id) argv.push("--team-id", validateSafeId(args.team_id, "team_id"));
+      if (args?.project) argv.push("--project", String(args.project));
+      if (args?.json) argv.push("--json");
+      return text(runCostRuntime(argv));
+    }
+    case "coord_cost_anomaly_check": {
+      const argv = ["anomaly-check"];
+      if (args?.team_id) argv.push("--team-id", validateSafeId(args.team_id, "team_id"));
+      if (args?.sensitivity != null) argv.push("--sensitivity", String(args.sensitivity));
+      if (args?.json) argv.push("--json");
+      return text(runCostRuntime(argv));
+    }
+    case "coord_cost_spend_leaderboard": {
+      const argv = ["spend-leaderboard"];
+      if (args?.window) argv.push("--window", String(args.window));
+      if (args?.group_by) argv.push("--group-by", String(args.group_by));
+      if (args?.limit != null) argv.push("--limit", String(args.limit));
+      if (args?.json) argv.push("--json");
+      return text(runCostRuntime(argv));
+    }
+    case "coord_cost_daily_report": {
+      const argv = ["daily-report"];
+      if (args?.window) argv.push("--window", String(args.window));
+      if (args?.team_id) argv.push("--team-id", validateSafeId(args.team_id, "team_id"));
+      if (args?.auto) argv.push("--auto");
+      if (args?.json) argv.push("--json");
+      return text(runCostRuntime(argv));
+    }
+    case "coord_cost_trends": {
+      const argv = ["cost-trends"];
+      if (args?.period) argv.push("--period", String(args.period));
+      if (args?.format) argv.push("--format", String(args.format));
+      if (args?.json) argv.push("--json");
+      return text(runCostRuntime(argv));
+    }
+
+    // --- Phase F: Observability handlers ---
+    case "coord_obs_health_report": {
+      const argv = ["health-report"];
+      if (args?.json) argv.push("--json");
+      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "observability.py"), ...argv], { encoding: "utf8", timeout: 60000 }));
+    }
+    case "coord_obs_timeline": {
+      const argv = ["timeline", "--team", validateSafeId(args.team_id, "team_id")];
+      if (args?.hours) argv.push("--hours", String(args.hours));
+      if (args?.json) argv.push("--json");
+      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "observability.py"), ...argv], { encoding: "utf8", timeout: 60000 }));
+    }
+    case "coord_obs_slo": {
+      const argv = ["slo", "--report"];
+      if (args?.json) argv.push("--json");
+      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "observability.py"), ...argv], { encoding: "utf8", timeout: 60000 }));
+    }
+    case "coord_obs_slo_snapshot": {
+      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "observability.py"), "slo"], { encoding: "utf8", timeout: 60000 }));
+    }
+    case "coord_obs_parity_history": {
+      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "observability.py"), "parity-history", "--report"], { encoding: "utf8", timeout: 60000 }));
+    }
+    case "coord_obs_audit_trail": {
+      const argv = ["audit-trail"];
+      if (args?.hours) argv.push("--hours", String(args.hours));
+      if (args?.json) argv.push("--json");
+      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "observability.py"), ...argv], { encoding: "utf8", timeout: 60000 }));
+    }
+
+    // --- Phase F: Policy handlers ---
+    case "coord_policy_lint": {
+      const argv = ["lint"];
+      if (args?.json) argv.push("--json");
+      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "policy_engine.py"), ...argv], { encoding: "utf8", timeout: 30000 }));
+    }
+    case "coord_policy_check_action": {
+      const argv = ["check-action", "--action", String(args.action)];
+      if (args?.team_id) argv.push("--team", validateSafeId(args.team_id, "team_id"));
+      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "policy_engine.py"), ...argv], { encoding: "utf8", timeout: 15000 }));
+    }
+    case "coord_policy_check_tools": {
+      const argv = ["check-tools", "--team", validateSafeId(args.team_id, "team_id"), "--tool", String(args.tool)];
+      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "policy_engine.py"), ...argv], { encoding: "utf8", timeout: 15000 }));
+    }
+    case "coord_policy_redact": {
+      const argv = ["redact", "--input", String(args.input)];
+      if (args?.mode) argv.push("--mode", String(args.mode));
+      if (args?.output) argv.push("--output", String(args.output));
+      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "policy_engine.py"), ...argv], { encoding: "utf8", timeout: 30000 }));
+    }
+    case "coord_policy_sign": {
+      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "policy_engine.py"), "sign", "--file", String(args.file)], { encoding: "utf8", timeout: 15000 }));
+    }
+    case "coord_policy_verify": {
+      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "policy_engine.py"), "verify", "--file", String(args.file)], { encoding: "utf8", timeout: 15000 }));
+    }
+
+    // --- Phase I: Collaboration handlers ---
+    case "coord_collab_set_role": {
+      const argv = ["set-role", "--team", validateSafeId(args.team_id, "team_id"), "--member", String(args.member), "--role", String(args.role)];
+      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "collaboration.py"), ...argv], { encoding: "utf8", timeout: 15000 }));
+    }
+    case "coord_collab_check_permission": {
+      const argv = ["check-permission", "--team", validateSafeId(args.team_id, "team_id"), "--member", String(args.member), "--action", String(args.action)];
+      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "collaboration.py"), ...argv], { encoding: "utf8", timeout: 15000 }));
+    }
+    case "coord_collab_handoff_create": {
+      const argv = ["handoff-create", "--team", validateSafeId(args.team_id, "team_id")];
+      if (args?.from) argv.push("--from", String(args.from));
+      if (args?.note) argv.push("--note", String(args.note));
+      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "collaboration.py"), ...argv], { encoding: "utf8", timeout: 30000 }));
+    }
+    case "coord_collab_handoff_latest": {
+      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "collaboration.py"), "handoff-latest", "--team", validateSafeId(args.team_id, "team_id")], { encoding: "utf8", timeout: 15000 }));
+    }
+    case "coord_collab_set_ownership": {
+      const argv = ["set-ownership", "--team", validateSafeId(args.team_id, "team_id")];
+      if (args?.owners) argv.push("--owners", String(args.owners));
+      if (args?.escalation) argv.push("--escalation", String(args.escalation));
+      if (args?.project) argv.push("--project", String(args.project));
+      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "collaboration.py"), ...argv], { encoding: "utf8", timeout: 15000 }));
+    }
+    case "coord_collab_set_presence": {
+      const argv = ["set-presence", "--team", validateSafeId(args.team_id, "team_id"), "--member", String(args.member), "--status", String(args.status)];
+      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "collaboration.py"), ...argv], { encoding: "utf8", timeout: 15000 }));
+    }
+    case "coord_collab_who": {
+      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "collaboration.py"), "who", "--team", validateSafeId(args.team_id, "team_id")], { encoding: "utf8", timeout: 15000 }));
+    }
+    case "coord_collab_comment": {
+      const argv = ["comment", "--team", validateSafeId(args.team_id, "team_id"), "--target", String(args.target), "--text", String(args.text), "--author", String(args.author)];
+      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "collaboration.py"), ...argv], { encoding: "utf8", timeout: 15000 }));
+    }
+    case "coord_collab_comments": {
+      const argv = ["comments", "--team", validateSafeId(args.team_id, "team_id")];
+      if (args?.target) argv.push("--target", String(args.target));
+      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "collaboration.py"), ...argv], { encoding: "utf8", timeout: 15000 }));
+    }
+
+    // --- Phase I: Smart Automation handlers ---
+    case "coord_auto_recommend_preset": {
+      const argv = ["recommend-preset"];
+      if (args?.team_id) argv.push("--team", validateSafeId(args.team_id, "team_id"));
+      if (args?.budget) argv.push("--budget", String(args.budget));
+      if (args?.task_type) argv.push("--task-type", String(args.task_type));
+      if (args?.repo) argv.push("--repo", String(args.repo));
+      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "smart_automation.py"), ...argv], { encoding: "utf8", timeout: 30000 }));
+    }
+    case "coord_auto_decompose": {
+      const argv = ["decompose", "--goal", String(args.goal)];
+      if (args?.team_id) argv.push("--team", validateSafeId(args.team_id, "team_id"));
+      if (args?.template) argv.push("--template", String(args.template));
+      if (args?.dry_run) argv.push("--dry-run");
+      if (args?.apply) argv.push("--apply");
+      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "smart_automation.py"), ...argv], { encoding: "utf8", timeout: 30000 }));
+    }
+    case "coord_auto_recover": {
+      const argv = ["auto-recover"];
+      if (args?.team_id) argv.push("--team", validateSafeId(args.team_id, "team_id"));
+      if (args?.all) argv.push("--all");
+      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "smart_automation.py"), ...argv], { encoding: "utf8", timeout: 90000 }));
+    }
+    case "coord_auto_scale": {
+      const argv = ["auto-scale", "--team", validateSafeId(args.team_id, "team_id")];
+      if (args?.dry_run) argv.push("--dry-run");
+      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "smart_automation.py"), ...argv], { encoding: "utf8", timeout: 60000 }));
+    }
+    case "coord_auto_weekly_optimize": {
+      const argv = ["weekly-optimize"];
+      if (args?.team_id) argv.push("--team", validateSafeId(args.team_id, "team_id"));
+      if (args?.all) argv.push("--all");
+      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "smart_automation.py"), ...argv], { encoding: "utf8", timeout: 60000 }));
     }
 
     default:

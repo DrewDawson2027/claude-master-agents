@@ -1,0 +1,122 @@
+{
+  "name": "claude-parity-layer",
+  "version": "1.0.0",
+  "description": "Full-parity local agent team orchestration layer for Claude Code",
+  "components": {
+    "runtime": {
+      "files": [
+        "scripts/team_runtime.py",
+        "scripts/cost_runtime.py",
+        "scripts/observability.py",
+        "scripts/policy_engine.py",
+        "scripts/release.py"
+      ],
+      "required": true
+    },
+    "hooks": {
+      "files": [
+        "hooks/token-guard.py",
+        "hooks/self-heal.py",
+        "hooks/session-register.sh",
+        "hooks/agent-lifecycle.sh",
+        "hooks/check-inbox.sh",
+        "hooks/read-efficiency-guard.py",
+        "hooks/pre-compact-save.sh",
+        "hooks/mcp-readiness.py",
+        "hooks/health-check.sh",
+        "hooks/terminal-heartbeat.sh",
+        "hooks/session-watchdog.sh",
+        "hooks/session-end.sh"
+      ],
+      "required": true
+    },
+    "governance": {
+      "files": [
+        "governance/TRUST_TIERS.md",
+        "governance/parity-rubric.json",
+        "governance/tier2-approvals.json",
+        "governance/marketplace-channels.json"
+      ],
+      "required": true
+    },
+    "coordinator": {
+      "files": [
+        "mcp-coordinator/index.js",
+        "mcp-coordinator/package.json",
+        "mcp-coordinator/package-lock.json"
+      ],
+      "required": true
+    },
+    "cost": {
+      "files": [
+        "cost/config.json",
+        "cost/budgets.json",
+        "cost/team-preset-profiles.json"
+      ],
+      "required": true
+    },
+    "commands": {
+      "pattern": "commands/ops-*.md",
+      "required": false
+    },
+    "team_commands": {
+      "pattern": "commands/team-*.md",
+      "required": false
+    },
+    "cost_commands": {
+      "pattern": "commands/cost*.md",
+      "required": false
+    },
+    "agents": {
+      "files": [
+        "agents/master-coder.md",
+        "agents/master-researcher.md",
+        "agents/master-architect.md",
+        "agents/master-workflow.md"
+      ],
+      "required": false
+    },
+    "agent_modes": {
+      "pattern": "master-agents/**/*.md",
+      "required": false
+    },
+    "distribution": {
+      "files": [
+        "distribution/manifest.json",
+        "distribution/compatibility.md"
+      ],
+      "required": false
+    },
+    "utilities": {
+      "files": [
+        "scripts/claude-stack",
+        "scripts/trust_audit.py",
+        "scripts/parity_audit.py",
+        "scripts/cost_doctor.py",
+        "scripts/snapshot_lock.py",
+        "scripts/sync_marketplaces.py",
+        "scripts/dead_capability_review.py",
+        "scripts/weekly_ops_digest.py",
+        "scripts/weekly_maintenance.sh",
+        "scripts/collaboration.py",
+        "scripts/smart_automation.py"
+      ],
+      "required": false
+    },
+    "docs": {
+      "files": [
+        "docs/operator-manual.md",
+        "docs/incident-runbooks.md",
+        "docs/architecture.md",
+        "docs/config-reference.md",
+        "docs/troubleshooting.md"
+      ],
+      "required": false
+    }
+  },
+  "compatibility": {
+    "claude_code_min": "1.0.0",
+    "node_min": "18.0.0",
+    "python_min": "3.10"
+  }
+}

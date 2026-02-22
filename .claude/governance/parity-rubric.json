@@ -1,0 +1,108 @@
+{
+  "categories": {
+    "runtime_orchestration": {
+      "required": [
+        "coord_team_bootstrap",
+        "coord_team_teardown",
+        "coord_team_resume",
+        "coord_team_doctor",
+        "coord_team_spawn_teammate",
+        "coord_team_focus",
+        "coord_team_interrupt"
+      ]
+    },
+    "context_communication": {
+      "required": [
+        "coord_team_send_peer",
+        "coord_team_ack_message",
+        "coord_team_check_events"
+      ]
+    },
+    "task_coordination": {
+      "required": [
+        "coord_team_add_task",
+        "coord_team_claim_task",
+        "coord_team_update_task",
+        "coord_team_release_claim",
+        "coord_team_dashboard"
+      ]
+    },
+    "cost_observability": {
+      "required": [
+        "coord_cost_summary",
+        "coord_cost_statusline",
+        "coord_cost_team",
+        "coord_cost_budget_status",
+        "coord_cost_set_budget"
+      ]
+    },
+    "reliability": {
+      "required": [
+        "team_runtime.py",
+        "cost_runtime.py",
+        "check-inbox.sh"
+      ]
+    },
+    "onboarding_repeatability": {
+      "required": [
+        "ONBOARDING.md",
+        "ops-team-bootstrap.md",
+        "ops-cost.md"
+      ]
+    },
+    "governance_security": {
+      "required": [
+        "TRUST_TIERS.md",
+        "marketplace-channels.json",
+        "tier2-approvals.json"
+      ]
+    },
+    "ecosystem_distribution_local": {
+      "required": [
+        "sync_marketplaces.py",
+        "snapshot_lock.py",
+        "dead_capability_review.py"
+      ]
+    },
+    "observability": {
+      "required": [
+        "coord_obs_health_report",
+        "coord_obs_timeline",
+        "coord_obs_slo",
+        "coord_obs_audit_trail"
+      ]
+    },
+    "policy_governance": {
+      "required": [
+        "coord_policy_lint",
+        "coord_policy_check_action",
+        "coord_policy_check_tools",
+        "coord_policy_redact",
+        "coord_policy_sign",
+        "coord_policy_verify"
+      ]
+    },
+    "collaboration": {
+      "required": [
+        "coord_collab_set_role",
+        "coord_collab_check_permission",
+        "coord_collab_handoff_create",
+        "coord_collab_handoff_latest",
+        "coord_collab_set_presence",
+        "coord_collab_who",
+        "coord_collab_comment",
+        "coord_collab_comments",
+        "coord_collab_set_ownership"
+      ]
+    },
+    "smart_automation": {
+      "required": [
+        "coord_auto_recommend_preset",
+        "coord_auto_decompose",
+        "coord_auto_recover",
+        "coord_auto_scale",
+        "coord_auto_weekly_optimize"
+      ]
+    }
+  }
+}

@@ -3,6 +3,49 @@
     "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
   },
   "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/drewdawson/.claude/hooks/edit-notify.sh stop",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/drewdawson/.claude/hooks/session-watchdog.sh",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "ExitPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/drewdawson/.claude/hooks/edit-notify.sh attention",
+            "timeout": 3
+          }
+        ]
+      },
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/drewdawson/.claude/hooks/edit-notify.sh attention",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Task",
@@ -67,6 +110,18 @@
           }
         ]
       }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/scripts/trust_audit.py --quiet",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   },
   "enabledPlugins": {
@@ -81,12 +136,12 @@
     "serena@claude-plugins-official": true,
     "typescript-lsp@claude-plugins-official": true,
     "pyright-lsp@claude-plugins-official": true,
-    "Notion@claude-plugins-official": true,
+    "Notion@claude-plugins-official": false,
     "supabase@claude-plugins-official": false,
     "pr-review-toolkit@claude-plugins-official": false,
     "hookify@claude-plugins-official": false,
     "linear@claude-plugins-official": false,
-    "figma@claude-plugins-official": true,
+    "figma@claude-plugins-official": false,
     "greptile@claude-plugins-official": true,
     "agent-sdk-dev@claude-plugins-official": false,
     "plugin-dev@claude-plugins-official": false,
