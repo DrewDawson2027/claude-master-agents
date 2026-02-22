@@ -18,6 +18,9 @@ Get a collaborator to a stable, low-cost default in under 5 minutes.
 2. In Claude, use:
    - `coord_team_dashboard`
    - `coord_team_scale_to_preset` / `coord_team_broadcast`
+   - `coord_team_restart_member` / `coord_team_replace_member`
+   - `coord_team_clone` / `coord_team_archive` / `coord_team_gc`
+   - `coord_team_auto_heal` for one-shot repair on active teams
    - `coord_team_add_task` / `coord_team_claim_task` / `coord_team_update_task`
    - `coord_team_doctor` / `coord_team_resume` for recovery
    - `coord_team_recover_hard` for one-command recovery + dashboard + cost snapshot
@@ -33,6 +36,7 @@ Get a collaborator to a stable, low-cost default in under 5 minutes.
 - Official updates: weekly via `~/.claude/scripts/weekly_maintenance.sh`.
 - Wrapper entrypoint: `~/.claude/scripts/claude-stack {doctor|install|update}`.
 - Team runtime health sweep: weekly maintenance runs `recover-hard` on active teams and writes a report.
+- Weekly preflight also runs `auto-heal` (one-shot) and `gc --dry-run`.
 - Weekly ops digest: generated under `~/.claude/reports/weekly-ops-digest-*.md`.
 - Community plugins: Tier 2 approval + pin + smoke test.
 - Monthly cleanup report: `~/.claude/scripts/monthly_purge.sh`.

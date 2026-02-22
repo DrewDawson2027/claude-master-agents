@@ -1002,6 +1002,60 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "coord_team_restart_member",
+      description: "Restart a teammate pane/member while preserving role and claimed task context.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+          member_id: { type: "string" },
+          cwd: { type: "string" },
+          agent: { type: "string" },
+          model: { type: "string" },
+          initial_prompt: { type: "string" },
+        },
+        required: ["team_id", "member_id"],
+      },
+    },
+    {
+      name: "coord_team_replace_member",
+      description: "Replace a failed member with a new member ID and transfer task/worker ownership.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+          old_member_id: { type: "string" },
+          new_member_id: { type: "string" },
+          new_name: { type: "string" },
+          cwd: { type: "string" },
+          agent: { type: "string" },
+          model: { type: "string" },
+          initial_prompt: { type: "string" },
+          force: { type: "boolean" },
+          stop_old: { type: "boolean" },
+          spawn_new: { type: "boolean" },
+        },
+        required: ["team_id", "old_member_id", "new_member_id"],
+      },
+    },
+    {
+      name: "coord_team_clone",
+      description: "Clone a team structure for a new repo/workstream with reset runtime state.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+          new_team_id: { type: "string" },
+          new_name: { type: "string" },
+          description: { type: "string" },
+          cwd: { type: "string" },
+          without_tasks: { type: "boolean" },
+          copy_task_status: { type: "boolean" },
+        },
+        required: ["team_id"],
+      },
+    },
+    {
       name: "coord_team_bootstrap",
       description: "Create/start a team and optionally spawn standard tmux pane teammates.",
       inputSchema: {
@@ -1030,6 +1084,32 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           kill_panes: { type: "boolean" },
         },
         required: ["team_id"],
+      },
+    },
+    {
+      name: "coord_team_archive",
+      description: "Archive a team into a compressed snapshot and remove active references.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+          force_stop: { type: "boolean" },
+          kill_panes: { type: "boolean" },
+          keep_team_dir: { type: "boolean" },
+        },
+        required: ["team_id"],
+      },
+    },
+    {
+      name: "coord_team_gc",
+      description: "Garbage collect stale team runtime artifacts (mailboxes, cursors, orphan tmux sessions).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          dry_run: { type: "boolean" },
+          prune_tmux: { type: "boolean" },
+          cursor_age_days: { type: "number" },
+        },
       },
     },
     {
@@ -1103,6 +1183,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           include_workers: { type: "boolean" },
         },
         required: ["team_id"],
+      },
+    },
+    {
+      name: "coord_team_auto_heal",
+      description: "Auto-heal active teams by reconciling and respawning broken pane members (one-shot or daemon loop).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+          ensure_tmux: { type: "boolean" },
+          daemon: { type: "boolean" },
+          interval_seconds: { type: "number" },
+          iterations: { type: "number" },
+        },
       },
     },
     {
@@ -2133,6 +2227,50 @@ return found`.trim();
       return text(runTeamRuntime(["team", "dashboard", "--team-id", validateSafeId(args.team_id, "team_id")]));
     }
 
+    case "coord_team_restart_member": {
+      const argv = [
+        "team", "restart-member",
+        "--team-id", validateSafeId(args.team_id, "team_id"),
+        "--member-id", validateSafeId(args.member_id, "member_id"),
+      ];
+      if (args?.cwd) argv.push("--cwd", String(args.cwd));
+      if (args?.agent) argv.push("--agent", String(args.agent));
+      if (args?.model) argv.push("--model", String(args.model));
+      if (args?.initial_prompt) argv.push("--initial-prompt", String(args.initial_prompt));
+      return text(runTeamRuntime(argv));
+    }
+
+    case "coord_team_replace_member": {
+      const argv = [
+        "team", "replace-member",
+        "--team-id", validateSafeId(args.team_id, "team_id"),
+        "--old-member-id", validateSafeId(args.old_member_id, "old_member_id"),
+        "--new-member-id", validateSafeId(args.new_member_id, "new_member_id"),
+      ];
+      if (args?.new_name) argv.push("--new-name", String(args.new_name));
+      if (args?.cwd) argv.push("--cwd", String(args.cwd));
+      if (args?.agent) argv.push("--agent", String(args.agent));
+      if (args?.model) argv.push("--model", String(args.model));
+      if (args?.initial_prompt) argv.push("--initial-prompt", String(args.initial_prompt));
+      if (args?.force) argv.push("--force");
+      if (args?.stop_old === false) argv.push("--no-stop-old");
+      else argv.push("--stop-old");
+      if (args?.spawn_new === false) argv.push("--no-spawn-new");
+      else argv.push("--spawn-new");
+      return text(runTeamRuntime(argv));
+    }
+
+    case "coord_team_clone": {
+      const argv = ["team", "clone", "--team-id", validateSafeId(args.team_id, "team_id")];
+      if (args?.new_team_id) argv.push("--new-team-id", validateSafeId(args.new_team_id, "new_team_id"));
+      if (args?.new_name) argv.push("--new-name", String(args.new_name));
+      if (args?.description) argv.push("--description", String(args.description));
+      if (args?.cwd) argv.push("--cwd", String(args.cwd));
+      if (args?.without_tasks) argv.push("--without-tasks");
+      if (args?.copy_task_status) argv.push("--copy-task-status");
+      return text(runTeamRuntime(argv));
+    }
+
     case "coord_team_bootstrap": {
       const argv = ["team", "bootstrap", "--name", String(args?.name ?? "")];
       if (args?.team_id) argv.push("--team-id", validateSafeId(args.team_id, "team_id"));
@@ -2151,6 +2289,22 @@ return found`.trim();
     case "coord_team_teardown": {
       const argv = ["team", "teardown", "--team-id", validateSafeId(args.team_id, "team_id")];
       if (args?.kill_panes) argv.push("--kill-panes");
+      return text(runTeamRuntime(argv));
+    }
+
+    case "coord_team_archive": {
+      const argv = ["team", "archive", "--team-id", validateSafeId(args.team_id, "team_id")];
+      if (args?.force_stop) argv.push("--force-stop");
+      if (args?.kill_panes) argv.push("--kill-panes");
+      if (args?.keep_team_dir) argv.push("--keep-team-dir");
+      return text(runTeamRuntime(argv));
+    }
+
+    case "coord_team_gc": {
+      const argv = ["team", "gc"];
+      if (args?.dry_run) argv.push("--dry-run");
+      if (args?.prune_tmux) argv.push("--prune-tmux");
+      if (typeof args?.cursor_age_days === "number") argv.push("--cursor-age-days", String(Math.max(1, Math.floor(args.cursor_age_days))));
       return text(runTeamRuntime(argv));
     }
 
@@ -2207,6 +2361,16 @@ return found`.trim();
       const argv = ["team", "reconcile", "--team-id", validateSafeId(args.team_id, "team_id")];
       if (args?.keep_events != null) argv.push("--keep-events", String(Math.trunc(Number(args.keep_events))));
       if (args?.include_workers) argv.push("--include-workers");
+      return text(runTeamRuntime(argv));
+    }
+
+    case "coord_team_auto_heal": {
+      const argv = ["team", "auto-heal"];
+      if (args?.team_id) argv.push("--team-id", validateSafeId(args.team_id, "team_id"));
+      if (args?.ensure_tmux) argv.push("--ensure-tmux");
+      if (args?.daemon) argv.push("--daemon");
+      if (typeof args?.interval_seconds === "number") argv.push("--interval-seconds", String(Math.max(1, Math.floor(args.interval_seconds))));
+      if (typeof args?.iterations === "number") argv.push("--iterations", String(Math.max(1, Math.floor(args.iterations))));
       return text(runTeamRuntime(argv));
     }
 

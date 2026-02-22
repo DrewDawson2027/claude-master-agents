@@ -9,12 +9,14 @@ import re
 import shlex
 import signal
 import subprocess
+import tarfile
 import sys
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+import shutil
 from typing import Any
 
 try:
@@ -29,6 +31,7 @@ TERMINALS_DIR = CLAUDE_DIR / "terminals"
 TEAM_INDEX_FILE = TEAMS_DIR / "index.json"
 INBOX_DIR = TERMINALS_DIR / "inbox"
 RESULTS_DIR = TERMINALS_DIR / "results"
+ARCHIVES_DIR = CLAUDE_DIR / "archives" / "teams"
 TEAM_PRESET_PROFILE_FILE = CLAUDE_DIR / "cost" / "team-preset-profiles.json"
 COST_CACHE_FILE = CLAUDE_DIR / "cost" / "cache.json"
 COST_BUDGETS_FILE = CLAUDE_DIR / "cost" / "budgets.json"
@@ -86,6 +89,7 @@ def ensure_dirs() -> None:
     TERMINALS_DIR.mkdir(parents=True, exist_ok=True)
     INBOX_DIR.mkdir(parents=True, exist_ok=True)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    ARCHIVES_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def canonical_path(path: str) -> str:
@@ -730,6 +734,9 @@ def cmd_teammate_spawn_pane(args: argparse.Namespace) -> str:
         m["paneId"] = pane_id
         m["paneTty"] = pane_tty
         m["tmuxSession"] = tmux_session
+        m["agent"] = args.agent
+        m["model"] = args.model
+        m["initialPrompt"] = args.initial_prompt
         m["tmuxSpawnMode"] = spawn_mode
         m["cwd"] = args.cwd or m.get("cwd")
         m["status"] = "starting"
@@ -1973,6 +1980,399 @@ def cmd_team_recover_hard_all(args: argparse.Namespace) -> str:
     return f"Recover-hard sweep complete. pass={passed} fail={failed} report={report}"
 
 
+def _tmux_pane_exists(pane_id: str | None) -> bool:
+    if not pane_id:
+        return False
+    try:
+        cp = subprocess.run(["tmux", "display-message", "-p", "-t", str(pane_id), "#{pane_id}"], capture_output=True, text=True)
+        return cp.returncode == 0 and (cp.stdout or "").strip() == str(pane_id)
+    except Exception:
+        return False
+
+
+def _remove_team_from_index(team_id: str) -> None:
+    idx = load_index()
+    idx["teams"] = [t for t in idx.get("teams", []) if t.get("id") != team_id]
+    save_index(idx)
+
+
+def _archive_team_dir(store: TeamStore, *, suffix: str = "archive") -> tuple[Path, str]:
+    ARCHIVES_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    archive_path = ARCHIVES_DIR / f"{store.team_id}-{suffix}-{ts}.tar.gz"
+    with tarfile.open(archive_path, "w:gz") as tf:
+        tf.add(store.paths.root, arcname=store.team_id)
+    h = hashlib.sha256()
+    with archive_path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    digest = h.hexdigest()
+    (archive_path.with_suffix(archive_path.suffix + ".sha256")).write_text(f"{digest}  {archive_path.name}\n", encoding="utf-8")
+    return archive_path, digest
+
+
+def _claimed_tasks_for_member(store: TeamStore, member_id: str) -> list[str]:
+    return [str(t.get("taskId")) for t in (store.load_tasks().get("tasks", []) or []) if t.get("claimedBy") == member_id]
+
+
+def cmd_team_restart_member(args: argparse.Namespace) -> str:
+    store = TeamStore(args.team_id)
+    if not store.exists():
+        raise SystemExit(f"Team {args.team_id} not found.")
+    member_id = safe_id(args.member_id, "member_id")
+    members = store.members_by_id()
+    m = members.get(member_id)
+    if not m:
+        raise SystemExit(f"Member {member_id} not found.")
+    claimed = _claimed_tasks_for_member(store, member_id)
+    pane_killed = False
+    if m.get("paneId"):
+        pane_killed = _kill_member_pane_if_present(store, m)
+    if m.get("kind") != "pane":
+        _update_member(store, member_id, lambda nm: nm.update({"status": "restart_requested", "restartRequestedAt": utc_now()}))
+        store.emit_event("TeammateRestartRequested", memberId=member_id, kind=m.get("kind"), claimedTasks=claimed)
+        return f"Restart requested for non-pane member {member_id}. claimed_tasks={len(claimed)}"
+
+    restart_prompt = args.initial_prompt
+    if not restart_prompt and claimed:
+        restart_prompt = f"Resume work after restart. Claimed tasks: {', '.join(claimed)}. Report status first."
+    cmd_teammate_spawn_pane(argparse.Namespace(
+        team_id=store.team_id,
+        member_id=member_id,
+        name=m.get("name") or member_id,
+        role=m.get("role") or "teammate",
+        cwd=args.cwd or m.get("cwd") or str(HOME),
+        agent=args.agent if getattr(args, "agent", None) is not None else m.get("agent"),
+        model=args.model if getattr(args, "model", None) is not None else m.get("model"),
+        initial_prompt=restart_prompt,
+    ))
+    store.emit_event("TeammateRestarted", memberId=member_id, paneKilled=bool(pane_killed), claimedTasks=claimed)
+    return f"Restarted member {member_id}. pane_killed={pane_killed} claimed_tasks={len(claimed)}"
+
+
+def cmd_team_replace_member(args: argparse.Namespace) -> str:
+    store = TeamStore(args.team_id)
+    if not store.exists():
+        raise SystemExit(f"Team {args.team_id} not found.")
+    old_id = safe_id(args.old_member_id, "old_member_id")
+    new_id = safe_id(args.new_member_id, "new_member_id")
+    cfg = store.load_config()
+    members = store.members_by_id()
+    old = members.get(old_id)
+    if not old:
+        raise SystemExit(f"Member {old_id} not found.")
+    if members.get(new_id) and not args.force:
+        raise SystemExit(f"Member {new_id} already exists.")
+    if cfg.get("leadMemberId") == old_id:
+        raise SystemExit("Replacing lead member is not supported in this command.")
+
+    # Add/overwrite new member entry cloned from old.
+    new_member = ensure_member_defaults({
+        **{k: v for k, v in dict(old).items() if k not in {"memberId", "name", "sessionId", "paneId", "paneTty", "hostPid", "status"}},
+        "memberId": new_id,
+        "name": args.new_name or new_id,
+        "sessionId": None,
+        "paneId": None,
+        "paneTty": None,
+        "hostPid": None,
+        "status": "idle",
+        "replacesMemberId": old_id,
+        "replacedAt": utc_now(),
+    })
+    cfg["members"] = [m for m in cfg.get("members", []) if m.get("memberId") != new_id]
+    cfg.setdefault("members", []).append(new_member)
+    for i, m in enumerate(cfg.get("members", [])):
+        if m.get("memberId") == old_id:
+            om = dict(m)
+            om["status"] = "replaced"
+            om["replacedBy"] = new_id
+            om["replacedAt"] = utc_now()
+            cfg["members"][i] = ensure_member_defaults(om)
+            break
+    store.save_config(cfg)
+
+    transferred_tasks: list[str] = []
+    with file_lock(store.paths.root / ".tasks.lock"):
+        doc = store.load_tasks()
+        for t in doc.get("tasks", []):
+            if t.get("claimedBy") == old_id:
+                t["claimedBy"] = new_id
+                t.setdefault("history", []).append({"ts": utc_now(), "action": "member_replaced", "from": old_id, "to": new_id})
+                transferred_tasks.append(str(t.get("taskId")))
+                cf = claim_file_path(store, t.get("taskId"))
+                if cf.exists():
+                    claim = read_json(cf, {}) or {}
+                    claim["claimedBy"] = new_id
+                    claim["previousOwner"] = old_id
+                    write_json(cf, claim)
+        store.save_tasks(doc)
+
+    wm = _load_worker_map(store)
+    transferred_workers = 0
+    for w in wm.get("workers", []):
+        if w.get("memberId") == old_id:
+            w["memberId"] = new_id
+            w["updatedAt"] = utc_now()
+            transferred_workers += 1
+    write_json(store.paths.worker_map, wm)
+
+    pane_stopped = False
+    if bool(args.stop_old) and old.get("paneId"):
+        pane_stopped = _kill_member_pane_if_present(store, old)
+    spawned = False
+    if bool(args.spawn_new) and str(old.get("kind")) == "pane":
+        cmd_teammate_spawn_pane(argparse.Namespace(
+            team_id=store.team_id,
+            member_id=new_id,
+            name=new_member.get("name") or new_id,
+            role=new_member.get("role") or "teammate",
+            cwd=args.cwd or new_member.get("cwd") or str(HOME),
+            agent=args.agent if getattr(args, "agent", None) is not None else old.get("agent"),
+            model=args.model if getattr(args, "model", None) is not None else old.get("model"),
+            initial_prompt=args.initial_prompt,
+        ))
+        spawned = True
+
+    store.emit_event(
+        "TeammateReplaced",
+        oldMemberId=old_id,
+        newMemberId=new_id,
+        transferredTasks=transferred_tasks,
+        transferredWorkers=transferred_workers,
+        stopOld=bool(args.stop_old),
+        spawnNew=bool(args.spawn_new),
+    )
+    return (
+        f"Replaced member {old_id} -> {new_id}. "
+        f"tasks_transferred={len(transferred_tasks)} workers_transferred={transferred_workers} "
+        f"pane_stopped={pane_stopped} spawned={spawned}"
+    )
+
+
+def cmd_team_clone(args: argparse.Namespace) -> str:
+    src = TeamStore(args.team_id)
+    if not src.exists():
+        raise SystemExit(f"Team {args.team_id} not found.")
+    new_team_id = safe_id(args.new_team_id or slugify(args.new_name or f"{src.team_id}-clone", "team"), "new_team_id")
+    dst = TeamStore(new_team_id)
+    if dst.exists():
+        raise SystemExit(f"Destination team {new_team_id} already exists.")
+    dst.ensure()
+    src_cfg = src.load_config()
+    dst_cfg = {
+        "id": new_team_id,
+        "name": args.new_name or f"{src_cfg.get('name', src.team_id)} Clone",
+        "description": args.description or f"Cloned from {src.team_id}",
+        "createdAt": utc_now(),
+        "clonedFrom": src.team_id,
+        "leadMemberId": src_cfg.get("leadMemberId") or "lead",
+        "leadSessionId": None,
+        "members": [],
+    }
+    for m in src_cfg.get("members", []):
+        nm = dict(m)
+        nm["sessionId"] = None
+        nm["paneId"] = None
+        nm["paneTty"] = None
+        nm["hostPid"] = None
+        nm["tmuxSession"] = None
+        nm["status"] = "idle" if nm.get("memberId") != dst_cfg["leadMemberId"] else "idle"
+        if args.cwd:
+            nm["cwd"] = args.cwd
+        dst_cfg["members"].append(ensure_member_defaults(nm))
+    dst.save_config(dst_cfg)
+    dst.save_runtime({"state": "stopped", "event_seq": 0, "tmux_session": None})
+
+    src_tasks = src.load_tasks().get("tasks", []) or []
+    out_tasks = []
+    if not args.without_tasks:
+        for t in src_tasks:
+            nt = dict(t)
+            nt["claimedBy"] = None
+            nt["claimedAt"] = None
+            nt["lastNote"] = None
+            if not args.copy_task_status:
+                deps = nt.get("dependsOn", []) or []
+                nt["status"] = "blocked" if deps else "pending"
+            nt["createdAt"] = utc_now()
+            nt["updatedAt"] = utc_now()
+            nt.setdefault("history", []).append({"ts": utc_now(), "action": "cloned_from", "team": src.team_id})
+            out_tasks.append(nt)
+    dst.save_tasks({"tasks": out_tasks})
+    write_json(dst.paths.worker_map, {"workers": []})
+    idx = load_index()
+    idx["teams"] = [t for t in idx.get("teams", []) if t.get("id") != new_team_id] + [{"id": new_team_id, "name": dst_cfg["name"], "createdAt": utc_now()}]
+    save_index(idx)
+    dst.emit_event("TeamCloned", sourceTeamId=src.team_id, taskCount=len(out_tasks))
+    return f"Cloned team {src.team_id} -> {new_team_id}. tasks={len(out_tasks)}"
+
+
+def cmd_team_archive(args: argparse.Namespace) -> str:
+    store = TeamStore(args.team_id)
+    if not store.exists():
+        raise SystemExit(f"Team {args.team_id} not found.")
+    rt = store.load_runtime()
+    if rt.get("state") in {"running", "paused"}:
+        if not args.force_stop:
+            raise SystemExit(f"Team {store.team_id} is {rt.get('state')}. Use --force-stop to archive.")
+        cmd_team_stop(argparse.Namespace(team_id=store.team_id, kill_panes=bool(args.kill_panes)))
+    # Snapshot before destructive actions.
+    backup_path, digest = _archive_team_dir(store, suffix="archive")
+    try:
+        store.emit_event("TeamArchived", archiveFile=str(backup_path), sha256=digest)
+    except Exception:
+        pass
+    removed = False
+    if not args.keep_team_dir:
+        shutil.rmtree(store.paths.root, ignore_errors=True)
+        removed = True
+    _remove_team_from_index(store.team_id)
+    return f"Archived team {store.team_id} -> {backup_path} sha256={digest[:12]} removed={removed}"
+
+
+def cmd_team_gc(args: argparse.Namespace) -> str:
+    ensure_dirs()
+    dry_run = bool(args.dry_run)
+    cursor_age_days = int(args.cursor_age_days or 30)
+    now = time.time()
+    removed: list[str] = []
+    findings: list[str] = []
+
+    # Prune orphan index entries.
+    idx = load_index()
+    teams_before = idx.get("teams", [])
+    teams_after = []
+    for row in teams_before:
+        tid = row.get("id")
+        if tid and TeamStore(str(tid)).exists():
+            teams_after.append(row)
+        else:
+            findings.append(f"orphan_index:{tid}")
+            if not dry_run:
+                removed.append(f"index:{tid}")
+    if not dry_run and len(teams_after) != len(teams_before):
+        idx["teams"] = teams_after
+        save_index(idx)
+
+    # Per-team mailbox/cursor cleanup.
+    referenced_tmux: set[str] = set()
+    for row in list_teams():
+        tid = str(row.get("team_id"))
+        store = TeamStore(tid)
+        if not store.exists():
+            continue
+        rt = store.load_runtime()
+        if rt.get("tmux_session"):
+            referenced_tmux.add(str(rt.get("tmux_session")))
+        members = set(store.members_by_id().keys())
+        for mb in store.paths.mailbox_dir.glob("*.jsonl"):
+            mid = mb.stem
+            if mid not in members:
+                findings.append(f"orphan_mailbox:{tid}:{mb.name}")
+                if not dry_run:
+                    mb.unlink(missing_ok=True)
+                    removed.append(f"mailbox:{tid}:{mb.name}")
+        for c in store.paths.cursors_dir.glob("*.txt"):
+            try:
+                age_days = (now - c.stat().st_mtime) / 86400.0
+            except Exception:
+                age_days = 0
+            if age_days > cursor_age_days:
+                findings.append(f"stale_cursor:{tid}:{c.name}:{int(age_days)}d")
+                if not dry_run:
+                    c.unlink(missing_ok=True)
+                    removed.append(f"cursor:{tid}:{c.name}")
+
+    # Optional tmux session prune.
+    if args.prune_tmux:
+        try:
+            cp = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"], capture_output=True, text=True)
+            if cp.returncode == 0:
+                for line in (cp.stdout or "").splitlines():
+                    s = line.strip()
+                    if not s.startswith("claude-team-"):
+                        continue
+                    if s in referenced_tmux:
+                        continue
+                    findings.append(f"orphan_tmux:{s}")
+                    if not dry_run:
+                        subprocess.run(["tmux", "kill-session", "-t", s], check=False)
+                        removed.append(f"tmux:{s}")
+        except Exception:
+            findings.append("tmux_list_failed")
+
+    return (
+        f"GC complete dry_run={dry_run} findings={len(findings)} removed={len(removed)}\n"
+        + ("\n".join([f"- {x}" for x in (removed if not dry_run else findings)][:200]) if (removed or findings) else "- none")
+    )
+
+
+def _auto_heal_team_once(team_id: str, *, ensure_tmux: bool = True) -> dict[str, Any]:
+    store = TeamStore(team_id)
+    if not store.exists():
+        return {"team_id": team_id, "ok": False, "error": "missing_team"}
+    actions: list[str] = []
+    try:
+        if ensure_tmux:
+            msg = cmd_team_resume(argparse.Namespace(team_id=team_id, ensure_tmux=True))
+            actions.append(f"resume:{msg}")
+    except Exception as e:
+        actions.append(f"resume_fail:{e}")
+    try:
+        rec = cmd_team_reconcile(argparse.Namespace(team_id=team_id, keep_events=None, include_workers=True))
+        actions.append(f"reconcile:{rec.splitlines()[0] if rec else 'ok'}")
+    except Exception as e:
+        actions.append(f"reconcile_fail:{e}")
+
+    respawned: list[str] = []
+    members = store.members_by_id()
+    for mid, m in members.items():
+        if str(m.get("kind")) != "pane":
+            continue
+        status = str(m.get("status") or "")
+        pane_id = m.get("paneId")
+        if status in {"paused", "replaced", "stopped"}:
+            continue
+        needs_respawn = (not pane_id) or (pane_id and not _tmux_pane_exists(str(pane_id)))
+        if not needs_respawn:
+            continue
+        try:
+            cmd_teammate_spawn_pane(argparse.Namespace(
+                team_id=team_id,
+                member_id=mid,
+                name=m.get("name") or mid,
+                role=m.get("role") or "teammate",
+                cwd=m.get("cwd") or str(HOME),
+                agent=m.get("agent"),
+                model=m.get("model"),
+                initial_prompt="Auto-heal restart: resume previous work and report status.",
+            ))
+            respawned.append(mid)
+        except Exception as e:
+            actions.append(f"respawn_fail:{mid}:{e}")
+    store.emit_event("TeamAutoHealed", respawned=respawned, actionCount=len(actions))
+    return {"team_id": team_id, "ok": True, "respawned": respawned, "actions": actions}
+
+
+def cmd_team_auto_heal(args: argparse.Namespace) -> str:
+    ensure_dirs()
+    targets = [safe_id(args.team_id, "team_id")] if args.team_id else [str(r.get("team_id")) for r in list_teams() if str(r.get("state")) in {"running", "paused"}]
+    if not targets:
+        return "No active teams found for auto-heal."
+    interval = max(1, int(args.interval_seconds or 60))
+    iterations = max(1, int(args.iterations or 1))
+    lines: list[str] = []
+    loop_count = iterations if args.daemon else 1
+    for i in range(loop_count):
+        lines.append(f"## Auto-Heal Iteration {i+1}/{loop_count}")
+        for tid in targets:
+            res = _auto_heal_team_once(tid, ensure_tmux=bool(args.ensure_tmux))
+            lines.append(f"- {tid}: ok={res.get('ok')} respawned={','.join(res.get('respawned', [])) or 'none'}")
+        if args.daemon and i < loop_count - 1:
+            time.sleep(interval)
+    return "\n".join(lines)
+
+
 def cmd_team_teardown(args: argparse.Namespace) -> str:
     store = TeamStore(args.team_id)
     if not store.exists():
@@ -2262,6 +2662,38 @@ def build_parser() -> argparse.ArgumentParser:
     t_dash = team_sp.add_parser("dashboard")
     t_dash.add_argument("--team-id", required=True)
 
+    t_restart_member = team_sp.add_parser("restart-member")
+    t_restart_member.add_argument("--team-id", required=True)
+    t_restart_member.add_argument("--member-id", required=True)
+    t_restart_member.add_argument("--cwd")
+    t_restart_member.add_argument("--agent")
+    t_restart_member.add_argument("--model")
+    t_restart_member.add_argument("--initial-prompt")
+
+    t_replace_member = team_sp.add_parser("replace-member")
+    t_replace_member.add_argument("--team-id", required=True)
+    t_replace_member.add_argument("--old-member-id", required=True)
+    t_replace_member.add_argument("--new-member-id", required=True)
+    t_replace_member.add_argument("--new-name")
+    t_replace_member.add_argument("--cwd")
+    t_replace_member.add_argument("--agent")
+    t_replace_member.add_argument("--model")
+    t_replace_member.add_argument("--initial-prompt")
+    t_replace_member.add_argument("--force", action="store_true")
+    t_replace_member.add_argument("--stop-old", dest="stop_old", action="store_true", default=True)
+    t_replace_member.add_argument("--no-stop-old", dest="stop_old", action="store_false")
+    t_replace_member.add_argument("--spawn-new", dest="spawn_new", action="store_true", default=True)
+    t_replace_member.add_argument("--no-spawn-new", dest="spawn_new", action="store_false")
+
+    t_clone = team_sp.add_parser("clone")
+    t_clone.add_argument("--team-id", required=True)
+    t_clone.add_argument("--new-team-id")
+    t_clone.add_argument("--new-name")
+    t_clone.add_argument("--description")
+    t_clone.add_argument("--cwd")
+    t_clone.add_argument("--without-tasks", action="store_true")
+    t_clone.add_argument("--copy-task-status", action="store_true")
+
     t_pause = team_sp.add_parser("pause")
     t_pause.add_argument("--team-id", required=True)
     t_pause.add_argument("--member-id", dest="member_ids", action="append")
@@ -2291,6 +2723,13 @@ def build_parser() -> argparse.ArgumentParser:
     t_recover_hard_all.add_argument("--snapshot-window", choices=["today", "week", "month", "active_block"], default="today")
     t_recover_hard_all.add_argument("--cost-timeout", type=int, default=20)
 
+    t_auto_heal = team_sp.add_parser("auto-heal")
+    t_auto_heal.add_argument("--team-id")
+    t_auto_heal.add_argument("--ensure-tmux", action="store_true")
+    t_auto_heal.add_argument("--daemon", action="store_true")
+    t_auto_heal.add_argument("--interval-seconds", type=int, default=60)
+    t_auto_heal.add_argument("--iterations", type=int, default=1)
+
     t_resume_all = team_sp.add_parser("resume-all")
     t_resume_all.add_argument("--ensure-tmux", action="store_true")
 
@@ -2308,6 +2747,17 @@ def build_parser() -> argparse.ArgumentParser:
     t_teardown = team_sp.add_parser("teardown")
     t_teardown.add_argument("--team-id", required=True)
     t_teardown.add_argument("--kill-panes", action="store_true")
+
+    t_archive = team_sp.add_parser("archive")
+    t_archive.add_argument("--team-id", required=True)
+    t_archive.add_argument("--force-stop", action="store_true")
+    t_archive.add_argument("--kill-panes", action="store_true")
+    t_archive.add_argument("--keep-team-dir", action="store_true")
+
+    t_gc = team_sp.add_parser("gc")
+    t_gc.add_argument("--dry-run", action="store_true")
+    t_gc.add_argument("--prune-tmux", action="store_true")
+    t_gc.add_argument("--cursor-age-days", type=int, default=30)
 
     t_scale = team_sp.add_parser("scale-to-preset")
     t_scale.add_argument("--team-id", required=True)
@@ -2501,6 +2951,12 @@ def dispatch(args: argparse.Namespace) -> str:
         return cmd_team_reconcile(args)
     if d == "team" and a == "dashboard":
         return cmd_team_dashboard(args)
+    if d == "team" and a == "restart-member":
+        return cmd_team_restart_member(args)
+    if d == "team" and a == "replace-member":
+        return cmd_team_replace_member(args)
+    if d == "team" and a == "clone":
+        return cmd_team_clone(args)
     if d == "team" and a == "pause":
         return cmd_team_pause(args)
     if d == "team" and a == "recover":
@@ -2509,12 +2965,18 @@ def dispatch(args: argparse.Namespace) -> str:
         return cmd_team_recover_hard(args)
     if d == "team" and a == "recover-hard-all":
         return cmd_team_recover_hard_all(args)
+    if d == "team" and a == "auto-heal":
+        return cmd_team_auto_heal(args)
     if d == "team" and a == "resume-all":
         return cmd_team_resume_all(args)
     if d == "team" and a == "bootstrap":
         return cmd_team_bootstrap(args)
     if d == "team" and a == "teardown":
         return cmd_team_teardown(args)
+    if d == "team" and a == "archive":
+        return cmd_team_archive(args)
+    if d == "team" and a == "gc":
+        return cmd_team_gc(args)
     if d == "team" and a == "scale-to-preset":
         return cmd_team_scale_to_preset(args)
     if d == "member" and a == "add":
