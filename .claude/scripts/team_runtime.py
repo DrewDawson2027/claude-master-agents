@@ -150,7 +150,13 @@ def ensure_dirs() -> None:
             {
                 "sqlite_messages": False,
                 "sqlite_events": False,
+                "sqlite_tasks": False,
+                "sqlite_claims": False,
+                "sqlite_workers": False,
                 "sqlite_dual_read_audit": True,
+                "sqlite_parity_gate_enabled": True,
+                "sqlite_parity_max_team_failures": 0,
+                "sqlite_parity_max_issue_count": 0,
             },
         )
 
@@ -168,12 +174,24 @@ def runtime_feature_flags() -> dict[str, Any]:
         {
             "sqlite_messages": False,
             "sqlite_events": False,
+            "sqlite_tasks": False,
+            "sqlite_claims": False,
+            "sqlite_workers": False,
             "sqlite_dual_read_audit": True,
+            "sqlite_parity_gate_enabled": True,
+            "sqlite_parity_max_team_failures": 0,
+            "sqlite_parity_max_issue_count": 0,
         },
     ) or {
         "sqlite_messages": False,
         "sqlite_events": False,
+        "sqlite_tasks": False,
+        "sqlite_claims": False,
+        "sqlite_workers": False,
         "sqlite_dual_read_audit": True,
+        "sqlite_parity_gate_enabled": True,
+        "sqlite_parity_max_team_failures": 0,
+        "sqlite_parity_max_issue_count": 0,
     }
 
 
@@ -365,6 +383,15 @@ class TeamStore:
             write_json(self.paths.tasks, {"tasks": []})
         if not self.paths.worker_map.exists():
             write_json(self.paths.worker_map, {"workers": []})
+        # Initialize shadow snapshots so parity audits are meaningful immediately.
+        try:
+            _shadow_sync_tasks(self, read_json(self.paths.tasks, {"tasks": []}) or {"tasks": []})
+            _shadow_sync_workers(
+                self, read_json(self.paths.worker_map, {"workers": []}) or {"workers": []}
+            )
+            _shadow_sync_claims(self)
+        except Exception:
+            pass
 
     def load_config(self) -> dict[str, Any]:
         cfg = read_json(self.paths.config, {}) or {}
@@ -387,7 +414,11 @@ class TeamStore:
         write_json(self.paths.runtime, runtime)
 
     def load_tasks(self) -> dict[str, Any]:
-        doc = read_json(self.paths.tasks, {"tasks": []}) or {"tasks": []}
+        doc = None
+        if feature_flag_enabled("sqlite_tasks", False):
+            doc = _load_tasks_doc_sqlite(self)
+        if doc is None:
+            doc = read_json(self.paths.tasks, {"tasks": []}) or {"tasks": []}
         if not isinstance(doc.get("tasks"), list):
             doc["tasks"] = []
         return doc
@@ -395,6 +426,25 @@ class TeamStore:
     def save_tasks(self, tasks: dict[str, Any]) -> None:
         tasks["updatedAt"] = utc_now()
         write_json(self.paths.tasks, tasks)
+        _shadow_sync_tasks(self, tasks)
+        _shadow_sync_claims(self)
+
+    def load_worker_map(self) -> dict[str, Any]:
+        doc = None
+        if feature_flag_enabled("sqlite_workers", False):
+            doc = _load_worker_doc_sqlite(self)
+        if doc is None:
+            doc = read_json(self.paths.worker_map, {"workers": []}) or {"workers": []}
+        if not isinstance(doc.get("workers"), list):
+            doc["workers"] = []
+        return doc
+
+    def save_worker_map(self, wm: dict[str, Any]) -> None:
+        if not isinstance(wm.get("workers"), list):
+            wm["workers"] = []
+        wm["updatedAt"] = utc_now()
+        write_json(self.paths.worker_map, wm)
+        _shadow_sync_workers(self, wm)
 
     def next_event_id(self) -> int:
         with file_lock(self.paths.root / ".runtime.lock"):
@@ -591,10 +641,28 @@ def load_event_ledger(store: TeamStore) -> list[dict[str, Any]]:
 
 
 def sqlite_shadow_parity_audit(store: TeamStore) -> dict[str, Any]:
+    # Seed missing shadows for legacy teams before comparing.
+    try:
+        if _load_tasks_doc_sqlite(store) is None:
+            _shadow_sync_tasks(store, read_json(store.paths.tasks, {"tasks": []}) or {"tasks": []})
+        if _load_worker_doc_sqlite(store) is None:
+            _shadow_sync_workers(
+                store, read_json(store.paths.worker_map, {"workers": []}) or {"workers": []}
+            )
+        if not _load_claims_from_sqlite(store) and any(store.paths.claims_dir.glob("*.json")):
+            _shadow_sync_claims(store)
+    except Exception:
+        pass
     msg_file = load_message_ledger_file(store)
     msg_sql = load_message_ledger_sqlite(store)
     ev_file = load_event_ledger_file(store)
     ev_sql = load_event_ledger_sqlite(store)
+    tasks_file = read_json(store.paths.tasks, {"tasks": []}) or {"tasks": []}
+    tasks_sql = _load_tasks_doc_sqlite(store) or {"tasks": []}
+    claims_file = _load_claims_from_files(store)
+    claims_sql = _load_claims_from_sqlite(store)
+    workers_file = read_json(store.paths.worker_map, {"workers": []}) or {"workers": []}
+    workers_sql = _load_worker_doc_sqlite(store) or {"workers": []}
 
     def _hash_rows(rows: list[dict[str, Any]]) -> str:
         h = hashlib.sha1()
@@ -625,6 +693,24 @@ def sqlite_shadow_parity_audit(store: TeamStore) -> dict[str, Any]:
             "fileHash": _hash_rows(ev_file),
             "sqliteHash": _hash_rows(ev_sql),
         },
+        "tasks": {
+            "fileCount": len(tasks_file.get("tasks", []) or []),
+            "sqliteCount": len(tasks_sql.get("tasks", []) or []),
+            "fileHash": _hash_rows(tasks_file.get("tasks", []) or []),
+            "sqliteHash": _hash_rows(tasks_sql.get("tasks", []) or []),
+        },
+        "claims": {
+            "fileCount": len(claims_file),
+            "sqliteCount": len(claims_sql),
+            "fileHash": _hash_rows(claims_file),
+            "sqliteHash": _hash_rows(claims_sql),
+        },
+        "workers": {
+            "fileCount": len(workers_file.get("workers", []) or []),
+            "sqliteCount": len(workers_sql.get("workers", []) or []),
+            "fileHash": _hash_rows(workers_file.get("workers", []) or []),
+            "sqliteHash": _hash_rows(workers_sql.get("workers", []) or []),
+        },
         "ok": True,
         "issues": [],
     }
@@ -643,6 +729,21 @@ def sqlite_shadow_parity_audit(store: TeamStore) -> dict[str, Any]:
         summary["issues"].append(
             "messages latest-message count mismatch "
             f"file={summary['messages']['fileLatestCount']} sqlite={summary['messages']['sqliteLatestCount']}"
+        )
+    if summary["tasks"]["fileCount"] != summary["tasks"]["sqliteCount"]:
+        summary["ok"] = False
+        summary["issues"].append(
+            f"tasks count mismatch file={summary['tasks']['fileCount']} sqlite={summary['tasks']['sqliteCount']}"
+        )
+    if summary["claims"]["fileCount"] != summary["claims"]["sqliteCount"]:
+        summary["ok"] = False
+        summary["issues"].append(
+            f"claims count mismatch file={summary['claims']['fileCount']} sqlite={summary['claims']['sqliteCount']}"
+        )
+    if summary["workers"]["fileCount"] != summary["workers"]["sqliteCount"]:
+        summary["ok"] = False
+        summary["issues"].append(
+            f"workers count mismatch file={summary['workers']['fileCount']} sqlite={summary['workers']['sqliteCount']}"
         )
     return summary
 
@@ -710,6 +811,60 @@ def _shadow_db_conn(store: TeamStore) -> sqlite3.Connection | None:
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_events_shadow_ts ON events_shadow(ts)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tasks_doc_shadow (
+              singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+              payload_json TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tasks_shadow (
+              task_id TEXT PRIMARY KEY,
+              status TEXT,
+              claimed_by TEXT,
+              priority TEXT,
+              payload_json TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS claims_shadow (
+              task_id TEXT PRIMARY KEY,
+              claimed_by TEXT,
+              status TEXT,
+              expires_at TEXT,
+              payload_json TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS workers_doc_shadow (
+              singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+              payload_json TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS workers_shadow (
+              worker_task_id TEXT PRIMARY KEY,
+              task_id TEXT,
+              member_id TEXT,
+              reported INTEGER NOT NULL DEFAULT 0,
+              payload_json TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
+            """
         )
         return conn
     except Exception:
@@ -791,11 +946,202 @@ def _shadow_counts(store: TeamStore) -> dict[str, int | bool]:
         counts["messagesSqlite"] = int(
             conn.execute("SELECT COUNT(*) FROM messages_shadow").fetchone()[0]
         )
+        counts["tasksSqlite"] = int(
+            conn.execute("SELECT COUNT(*) FROM tasks_shadow").fetchone()[0]
+        )
+        counts["claimsSqlite"] = int(
+            conn.execute("SELECT COUNT(*) FROM claims_shadow").fetchone()[0]
+        )
+        counts["workersSqlite"] = int(
+            conn.execute("SELECT COUNT(*) FROM workers_shadow").fetchone()[0]
+        )
     except Exception:
         pass
     finally:
         conn.close()
     return counts
+
+
+def _shadow_sync_tasks(store: TeamStore, tasks_doc: dict[str, Any]) -> None:
+    conn = _shadow_db_conn(store)
+    if conn is None:
+        return
+    try:
+        payload = json.dumps(tasks_doc, sort_keys=True, separators=(",", ":"))
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO tasks_doc_shadow(singleton_id, payload_json, updated_at)
+            VALUES(1, ?, ?)
+            """,
+            (payload, utc_now()),
+        )
+        conn.execute("DELETE FROM tasks_shadow")
+        for t in tasks_doc.get("tasks", []) or []:
+            task_id = str(t.get("taskId") or "")
+            if not task_id:
+                continue
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO tasks_shadow(task_id, status, claimed_by, priority, payload_json, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    t.get("status"),
+                    t.get("claimedBy"),
+                    t.get("priority"),
+                    json.dumps(t, sort_keys=True, separators=(",", ":")),
+                    utc_now(),
+                ),
+            )
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
+
+def _load_tasks_doc_sqlite(store: TeamStore) -> dict[str, Any] | None:
+    conn = _shadow_db_conn(store)
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT payload_json FROM tasks_doc_shadow WHERE singleton_id = 1"
+        ).fetchone()
+        if not row or not row[0]:
+            return None
+        doc = json.loads(row[0])
+        if not isinstance(doc, dict):
+            return None
+        if not isinstance(doc.get("tasks"), list):
+            doc["tasks"] = []
+        return doc
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+
+def _shadow_sync_workers(store: TeamStore, worker_doc: dict[str, Any]) -> None:
+    conn = _shadow_db_conn(store)
+    if conn is None:
+        return
+    try:
+        payload = json.dumps(worker_doc, sort_keys=True, separators=(",", ":"))
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO workers_doc_shadow(singleton_id, payload_json, updated_at)
+            VALUES(1, ?, ?)
+            """,
+            (payload, utc_now()),
+        )
+        conn.execute("DELETE FROM workers_shadow")
+        for w in worker_doc.get("workers", []) or []:
+            wid = str(w.get("workerTaskId") or "")
+            if not wid:
+                continue
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO workers_shadow(worker_task_id, task_id, member_id, reported, payload_json, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    wid,
+                    w.get("taskId"),
+                    w.get("memberId"),
+                    1 if w.get("reported") else 0,
+                    json.dumps(w, sort_keys=True, separators=(",", ":")),
+                    utc_now(),
+                ),
+            )
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
+
+def _load_worker_doc_sqlite(store: TeamStore) -> dict[str, Any] | None:
+    conn = _shadow_db_conn(store)
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT payload_json FROM workers_doc_shadow WHERE singleton_id = 1"
+        ).fetchone()
+        if not row or not row[0]:
+            return None
+        doc = json.loads(row[0])
+        if not isinstance(doc, dict):
+            return None
+        if not isinstance(doc.get("workers"), list):
+            doc["workers"] = []
+        return doc
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+
+def _load_claims_from_files(store: TeamStore) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for cf in sorted(store.paths.claims_dir.glob("*.json")):
+        doc = read_json(cf, None)
+        if isinstance(doc, dict):
+            out.append(doc)
+    return out
+
+
+def _shadow_sync_claims(store: TeamStore) -> None:
+    conn = _shadow_db_conn(store)
+    if conn is None:
+        return
+    try:
+        claims = _load_claims_from_files(store)
+        conn.execute("DELETE FROM claims_shadow")
+        for c in claims:
+            task_id = str(c.get("taskId") or "")
+            if not task_id:
+                continue
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO claims_shadow(task_id, claimed_by, status, expires_at, payload_json, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    c.get("claimedBy"),
+                    c.get("status"),
+                    c.get("expiresAt"),
+                    json.dumps(c, sort_keys=True, separators=(",", ":")),
+                    utc_now(),
+                ),
+            )
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
+
+def _load_claims_from_sqlite(store: TeamStore) -> list[dict[str, Any]]:
+    conn = _shadow_db_conn(store)
+    if conn is None:
+        return []
+    out: list[dict[str, Any]] = []
+    try:
+        rows = conn.execute("SELECT payload_json FROM claims_shadow ORDER BY task_id").fetchall()
+        for (payload_json,) in rows:
+            try:
+                out.append(json.loads(payload_json))
+            except Exception:
+                continue
+    except Exception:
+        return []
+    finally:
+        conn.close()
+    return out
 
 
 def claim_file_path(store: TeamStore, task_id: str) -> Path:
@@ -846,6 +1192,8 @@ def expire_stale_claims(store: TeamStore) -> list[str]:
         if changed:
             _refresh_task_blocked_state(doc)
             store.save_tasks(doc)
+    if expired:
+        _shadow_sync_claims(store)
     return expired
 
 
@@ -881,6 +1229,8 @@ def refresh_member_claim_heartbeats(store: TeamStore, member_id: str) -> int:
             )
             write_json(cf, claim)
             count += 1
+        if count:
+            _shadow_sync_claims(store)
     return count
 
 
@@ -4408,10 +4758,14 @@ def cmd_admin_sqlite_parity(args: argparse.Namespace) -> str:
             continue
         audits.append(sqlite_shadow_parity_audit(store))
     overall_ok = all(bool(a.get("ok")) for a in audits) if audits else True
+    team_failures = sum(1 for a in audits if not bool(a.get("ok")))
+    issue_count = sum(len(a.get("issues", []) or []) for a in audits)
     payload = {
         "ts": utc_now(),
         "ok": overall_ok,
         "count": len(audits),
+        "teamFailures": team_failures,
+        "issueCount": issue_count,
         "teams": audits,
     }
     report_path = None
@@ -4669,7 +5023,7 @@ def cmd_team_replace_member(args: argparse.Namespace) -> str:
             w["memberId"] = new_id
             w["updatedAt"] = utc_now()
             transferred_workers += 1
-    write_json(store.paths.worker_map, wm)
+    store.save_worker_map(wm)
 
     pane_stopped = False
     if bool(args.stop_old) and old.get("paneId"):
@@ -4767,7 +5121,7 @@ def cmd_team_clone(args: argparse.Namespace) -> str:
             )
             out_tasks.append(nt)
     dst.save_tasks({"tasks": out_tasks})
-    write_json(dst.paths.worker_map, {"workers": []})
+    dst.save_worker_map({"workers": []})
     idx = load_index()
     idx["teams"] = [t for t in idx.get("teams", []) if t.get("id") != new_team_id] + [
         {"id": new_team_id, "name": dst_cfg["name"], "createdAt": utc_now()}
@@ -5020,7 +5374,7 @@ def cmd_team_teardown(args: argparse.Namespace) -> str:
 
 
 def _load_worker_map(store: TeamStore) -> dict[str, Any]:
-    wm = read_json(store.paths.worker_map, {"workers": []}) or {"workers": []}
+    wm = store.load_worker_map()
     if not isinstance(wm.get("workers"), list):
         wm["workers"] = []
     return wm
@@ -5043,7 +5397,7 @@ def cmd_worker_register(args: argparse.Namespace) -> str:
         "autoCompleteOnWorkerSuccess": bool(args.auto_complete),
     }
     wm["workers"].append(row)
-    write_json(store.paths.worker_map, wm)
+    store.save_worker_map(wm)
     store.emit_event(
         "TaskWorkerRegistered",
         workerTaskId=wid,
@@ -5067,7 +5421,7 @@ def cmd_worker_attach_result(args: argparse.Namespace) -> str:
         target["taskId"] = args.task_id
     if args.member_id:
         target["memberId"] = args.member_id
-    write_json(store.paths.worker_map, wm)
+    store.save_worker_map(wm)
     store.emit_event(
         "TaskWorkerAttached",
         workerTaskId=wid,
@@ -5196,9 +5550,7 @@ def cmd_hook_reconcile_workers(args: argparse.Namespace) -> str:
     count = 0
     for team in list_teams():
         store = TeamStore(team["team_id"])
-        worker_map = read_json(store.paths.worker_map, {"workers": []}) or {
-            "workers": []
-        }
+        worker_map = store.load_worker_map()
         changed = False
         for w in worker_map.get("workers", []):
             if w.get("reported"):
@@ -5240,7 +5592,7 @@ def cmd_hook_reconcile_workers(args: argparse.Namespace) -> str:
             count += 1
             changed = True
         if changed:
-            write_json(store.paths.worker_map, worker_map)
+            store.save_worker_map(worker_map)
     return f"Reconciled {count} worker completion(s)."
 
 

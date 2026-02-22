@@ -1,5 +1,11 @@
 {
   "sqlite_messages": false,
   "sqlite_events": false,
-  "sqlite_dual_read_audit": true
+  "sqlite_tasks": false,
+  "sqlite_claims": false,
+  "sqlite_workers": false,
+  "sqlite_dual_read_audit": true,
+  "sqlite_parity_gate_enabled": true,
+  "sqlite_parity_max_team_failures": 0,
+  "sqlite_parity_max_issue_count": 0
 }

@@ -2365,6 +2365,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return applyLegacyDeprecationToOutput(toolName, out);
     });
   };
+  const pythonScriptTool = (scriptName, argv, timeoutMs = 60000) => {
+    const fullArgv = [join(homedir(), ".claude", "scripts", scriptName), ...argv];
+    if (ASYNC_COORDINATOR_HANDLERS) {
+      return withEnvelopeAsync(name, startedAt, requestId, () =>
+        runExecFileAsync("python3", fullArgv, { timeoutMs, label: scriptName })
+      );
+    }
+    return withEnvelope(name, startedAt, requestId, () =>
+      execFileSync("python3", fullArgv, { encoding: "utf8", timeout: timeoutMs })
+    );
+  };
 
   try {
   switch (name) {
@@ -3706,100 +3717,100 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case "coord_obs_health_report": {
       const argv = ["health-report"];
       if (args?.json) argv.push("--json");
-      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "observability.py"), ...argv], { encoding: "utf8", timeout: 60000 }));
+      return pythonScriptTool("observability.py", argv, 60000);
     }
     case "coord_obs_timeline": {
       const argv = ["timeline", "--team", validateSafeId(args.team_id, "team_id")];
       if (args?.hours) argv.push("--hours", String(args.hours));
       if (args?.json) argv.push("--json");
-      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "observability.py"), ...argv], { encoding: "utf8", timeout: 60000 }));
+      return pythonScriptTool("observability.py", argv, 60000);
     }
     case "coord_obs_slo": {
       const argv = ["slo", "--report"];
       if (args?.json) argv.push("--json");
-      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "observability.py"), ...argv], { encoding: "utf8", timeout: 60000 }));
+      return pythonScriptTool("observability.py", argv, 60000);
     }
     case "coord_obs_slo_snapshot": {
-      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "observability.py"), "slo"], { encoding: "utf8", timeout: 60000 }));
+      return pythonScriptTool("observability.py", ["slo"], 60000);
     }
     case "coord_obs_parity_history": {
-      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "observability.py"), "parity-history", "--report"], { encoding: "utf8", timeout: 60000 }));
+      return pythonScriptTool("observability.py", ["parity-history", "--report"], 60000);
     }
     case "coord_obs_audit_trail": {
       const argv = ["audit-trail"];
       if (args?.hours) argv.push("--hours", String(args.hours));
       if (args?.json) argv.push("--json");
-      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "observability.py"), ...argv], { encoding: "utf8", timeout: 60000 }));
+      return pythonScriptTool("observability.py", argv, 60000);
     }
 
     // --- Phase F: Policy handlers ---
     case "coord_policy_lint": {
       const argv = ["lint"];
       if (args?.json) argv.push("--json");
-      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "policy_engine.py"), ...argv], { encoding: "utf8", timeout: 30000 }));
+      return pythonScriptTool("policy_engine.py", argv, 30000);
     }
     case "coord_policy_check_action": {
       const argv = ["check-action", "--action", String(args.action)];
       if (args?.team_id) argv.push("--team", validateSafeId(args.team_id, "team_id"));
-      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "policy_engine.py"), ...argv], { encoding: "utf8", timeout: 15000 }));
+      return pythonScriptTool("policy_engine.py", argv, 15000);
     }
     case "coord_policy_check_tools": {
       const argv = ["check-tools", "--team", validateSafeId(args.team_id, "team_id"), "--tool", String(args.tool)];
-      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "policy_engine.py"), ...argv], { encoding: "utf8", timeout: 15000 }));
+      return pythonScriptTool("policy_engine.py", argv, 15000);
     }
     case "coord_policy_redact": {
       const argv = ["redact", "--input", String(args.input)];
       if (args?.mode) argv.push("--mode", String(args.mode));
       if (args?.output) argv.push("--output", String(args.output));
-      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "policy_engine.py"), ...argv], { encoding: "utf8", timeout: 30000 }));
+      return pythonScriptTool("policy_engine.py", argv, 30000);
     }
     case "coord_policy_sign": {
-      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "policy_engine.py"), "sign", "--file", String(args.file)], { encoding: "utf8", timeout: 15000 }));
+      return pythonScriptTool("policy_engine.py", ["sign", "--file", String(args.file)], 15000);
     }
     case "coord_policy_verify": {
-      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "policy_engine.py"), "verify", "--file", String(args.file)], { encoding: "utf8", timeout: 15000 }));
+      return pythonScriptTool("policy_engine.py", ["verify", "--file", String(args.file)], 15000);
     }
 
     // --- Phase I: Collaboration handlers ---
     case "coord_collab_set_role": {
       const argv = ["set-role", "--team", validateSafeId(args.team_id, "team_id"), "--member", String(args.member), "--role", String(args.role)];
-      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "collaboration.py"), ...argv], { encoding: "utf8", timeout: 15000 }));
+      return pythonScriptTool("collaboration.py", argv, 15000);
     }
     case "coord_collab_check_permission": {
       const argv = ["check-permission", "--team", validateSafeId(args.team_id, "team_id"), "--member", String(args.member), "--action", String(args.action)];
-      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "collaboration.py"), ...argv], { encoding: "utf8", timeout: 15000 }));
+      return pythonScriptTool("collaboration.py", argv, 15000);
     }
     case "coord_collab_handoff_create": {
       const argv = ["handoff-create", "--team", validateSafeId(args.team_id, "team_id")];
       if (args?.from) argv.push("--from", String(args.from));
       if (args?.note) argv.push("--note", String(args.note));
-      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "collaboration.py"), ...argv], { encoding: "utf8", timeout: 30000 }));
+      return pythonScriptTool("collaboration.py", argv, 30000);
     }
     case "coord_collab_handoff_latest": {
-      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "collaboration.py"), "handoff-latest", "--team", validateSafeId(args.team_id, "team_id")], { encoding: "utf8", timeout: 15000 }));
+      return pythonScriptTool("collaboration.py", ["handoff-latest", "--team", validateSafeId(args.team_id, "team_id")], 15000);
     }
     case "coord_collab_set_ownership": {
       const argv = ["set-ownership", "--team", validateSafeId(args.team_id, "team_id")];
       if (args?.owners) argv.push("--owners", String(args.owners));
       if (args?.escalation) argv.push("--escalation", String(args.escalation));
       if (args?.project) argv.push("--project", String(args.project));
-      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "collaboration.py"), ...argv], { encoding: "utf8", timeout: 15000 }));
+      return pythonScriptTool("collaboration.py", argv, 15000);
     }
     case "coord_collab_set_presence": {
       const argv = ["set-presence", "--team", validateSafeId(args.team_id, "team_id"), "--member", String(args.member), "--status", String(args.status)];
-      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "collaboration.py"), ...argv], { encoding: "utf8", timeout: 15000 }));
+      return pythonScriptTool("collaboration.py", argv, 15000);
     }
     case "coord_collab_who": {
-      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "collaboration.py"), "who", "--team", validateSafeId(args.team_id, "team_id")], { encoding: "utf8", timeout: 15000 }));
+      return pythonScriptTool("collaboration.py", ["who", "--team", validateSafeId(args.team_id, "team_id")], 15000);
     }
     case "coord_collab_comment": {
       const argv = ["comment", "--team", validateSafeId(args.team_id, "team_id"), "--target", String(args.target), "--text", String(args.text), "--author", String(args.author)];
-      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "collaboration.py"), ...argv], { encoding: "utf8", timeout: 15000 }));
+      return pythonScriptTool("collaboration.py", argv, 15000);
     }
     case "coord_collab_comments": {
       const argv = ["comments", "--team", validateSafeId(args.team_id, "team_id")];
       if (args?.target) argv.push("--target", String(args.target));
-      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "collaboration.py"), ...argv], { encoding: "utf8", timeout: 15000 }));
+      return pythonScriptTool("collaboration.py", argv, 15000);
     }
 
     // --- Phase I: Smart Automation handlers ---
@@ -3809,7 +3820,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (args?.budget) argv.push("--budget", String(args.budget));
       if (args?.task_type) argv.push("--task-type", String(args.task_type));
       if (args?.repo) argv.push("--repo", String(args.repo));
-      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "smart_automation.py"), ...argv], { encoding: "utf8", timeout: 30000 }));
+      return pythonScriptTool("smart_automation.py", argv, 30000);
     }
     case "coord_auto_decompose": {
       const argv = ["decompose", "--goal", String(args.goal)];
@@ -3817,24 +3828,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (args?.template) argv.push("--template", String(args.template));
       if (args?.dry_run) argv.push("--dry-run");
       if (args?.apply) argv.push("--apply");
-      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "smart_automation.py"), ...argv], { encoding: "utf8", timeout: 30000 }));
+      return pythonScriptTool("smart_automation.py", argv, 30000);
     }
     case "coord_auto_recover": {
       const argv = ["auto-recover"];
       if (args?.team_id) argv.push("--team", validateSafeId(args.team_id, "team_id"));
       if (args?.all) argv.push("--all");
-      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "smart_automation.py"), ...argv], { encoding: "utf8", timeout: 90000 }));
+      return pythonScriptTool("smart_automation.py", argv, 90000);
     }
     case "coord_auto_scale": {
       const argv = ["auto-scale", "--team", validateSafeId(args.team_id, "team_id")];
       if (args?.dry_run) argv.push("--dry-run");
-      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "smart_automation.py"), ...argv], { encoding: "utf8", timeout: 60000 }));
+      return pythonScriptTool("smart_automation.py", argv, 60000);
     }
     case "coord_auto_weekly_optimize": {
       const argv = ["weekly-optimize"];
       if (args?.team_id) argv.push("--team", validateSafeId(args.team_id, "team_id"));
       if (args?.all) argv.push("--all");
-      return text(execFileSync("python3", [join(homedir(), ".claude", "scripts", "smart_automation.py"), ...argv], { encoding: "utf8", timeout: 60000 }));
+      return pythonScriptTool("smart_automation.py", argv, 60000);
     }
 
     default:
