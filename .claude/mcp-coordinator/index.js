@@ -901,6 +901,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "coord_team_recover_hard",
+      description: "Run resume + reconcile + doctor + dashboard + cost snapshot and write a recovery snapshot file.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+          ensure_tmux: { type: "boolean" },
+          keep_events: { type: "number" },
+          include_workers: { type: "boolean" },
+          snapshot_window: { type: "string", enum: ["today", "week", "month", "active_block"] },
+          cost_timeout: { type: "number" },
+        },
+        required: ["team_id"],
+      },
+    },
+    {
       name: "coord_team_recover",
       description: "Run team resume + reconcile + doctor in one command for recovery.",
       inputSchema: {
@@ -1949,6 +1965,17 @@ return found`.trim();
       if (args?.types) argv.push("--types", String(args.types));
       if (args?.since_id != null) argv.push("--since-id", String(Math.trunc(Number(args.since_id))));
       if (args?.consumer) argv.push("--consumer", validateSafeId(args.consumer, "consumer"));
+      return text(runTeamRuntime(argv));
+    }
+
+    case "coord_team_recover_hard": {
+      const argv = ["team", "recover-hard", "--team-id", validateSafeId(args.team_id, "team_id")];
+      if (args?.ensure_tmux) argv.push("--ensure-tmux");
+      if (typeof args?.keep_events === "number") argv.push("--keep-events", String(Math.max(1, Math.floor(args.keep_events))));
+      if (args?.include_workers === false) argv.push("--no-include-workers");
+      else argv.push("--include-workers");
+      if (args?.snapshot_window) argv.push("--snapshot-window", String(args.snapshot_window));
+      if (typeof args?.cost_timeout === "number") argv.push("--cost-timeout", String(Math.max(3, Math.floor(args.cost_timeout))));
       return text(runTeamRuntime(argv));
     }
 

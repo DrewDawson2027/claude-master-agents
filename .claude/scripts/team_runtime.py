@@ -1298,6 +1298,24 @@ def _try_cost_summary(team_id: str | None = None) -> str | None:
     return None
 
 
+def _cost_snapshot_json(team_id: str, window: str = "today", timeout_sec: int = 20) -> dict[str, Any]:
+    cost_script = CLAUDE_DIR / "scripts" / "cost_runtime.py"
+    if not cost_script.exists():
+        return {"ok": False, "error": "cost_runtime_missing"}
+    argv = ["python3", str(cost_script), "summary", "--window", window, "--team-id", team_id, "--json"]
+    try:
+        out = subprocess.run(argv, capture_output=True, text=True, timeout=max(3, int(timeout_sec)), check=False)
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:300]}
+    if out.returncode != 0:
+        return {"ok": False, "error": (out.stderr or out.stdout or "").strip()[:800]}
+    try:
+        payload = json.loads(out.stdout)
+        return {"ok": True, "summary": payload}
+    except Exception as e:
+        return {"ok": False, "error": f"invalid_json: {e}", "raw": (out.stdout or "")[:800]}
+
+
 def cmd_team_dashboard(args: argparse.Namespace) -> str:
     store = TeamStore(args.team_id)
     if not store.exists():
@@ -1557,6 +1575,62 @@ def cmd_team_recover(args: argparse.Namespace) -> str:
     parts.append(cmd_team_doctor(argparse.Namespace(team_id=team_id)))
     TeamStore(team_id).emit_event("TeamRecovered", ensureTmux=bool(args.ensure_tmux), includeWorkers=bool(getattr(args, "include_workers", True)))
     return "\n\n".join(parts)
+
+
+def cmd_team_recover_hard(args: argparse.Namespace) -> str:
+    team_id = safe_id(args.team_id, "team_id")
+    store = TeamStore(team_id)
+    if not store.exists():
+        raise SystemExit(f"Team {team_id} not found.")
+    recover_out = cmd_team_recover(argparse.Namespace(
+        team_id=team_id,
+        ensure_tmux=bool(args.ensure_tmux),
+        keep_events=getattr(args, "keep_events", None),
+        include_workers=bool(getattr(args, "include_workers", True)),
+    ))
+    dashboard_out = cmd_team_dashboard(argparse.Namespace(team_id=team_id))
+    snapshot_window = getattr(args, "snapshot_window", None) or "today"
+    cost = _cost_snapshot_json(team_id, window=snapshot_window, timeout_sec=int(getattr(args, "cost_timeout", 20) or 20))
+    snapshot = {
+        "team_id": team_id,
+        "ts": utc_now(),
+        "kind": "recover-hard",
+        "snapshotWindow": snapshot_window,
+        "recover": {"text": recover_out},
+        "dashboard": {"text": dashboard_out},
+        "cost": cost,
+        "runtime": store.load_runtime(),
+        "taskCounts": _dashboard_task_counts(store.load_tasks()),
+    }
+    out_file = store.paths.root / f"recover-hard-snapshot-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+    write_json(out_file, snapshot)
+    store.emit_event(
+        "TeamRecoveredHard",
+        snapshotFile=str(out_file),
+        snapshotWindow=snapshot_window,
+        costOk=bool(cost.get("ok")),
+        ensureTmux=bool(args.ensure_tmux),
+        includeWorkers=bool(getattr(args, "include_workers", True)),
+    )
+    bits = [
+        "## Team Recover Hard",
+        recover_out,
+        dashboard_out,
+        f"Recovery snapshot: {out_file}",
+    ]
+    if cost.get("ok"):
+        csum = (cost.get("summary") or {})
+        totals = (csum.get("totals") or {})
+        budget = (csum.get("budget") or {})
+        bits.append(
+            "Cost snapshot "
+            f"({snapshot_window}): total={totals.get('totalUSD')} local={totals.get('localCostUSD')} "
+            f"in={totals.get('inputTokens')} out={totals.get('outputTokens')} "
+            f"budget={budget.get('level')} pct={budget.get('pct')}"
+        )
+    else:
+        bits.append(f"Cost snapshot failed: {cost.get('error')}")
+    return "\n\n".join(bits)
 
 
 def cmd_team_teardown(args: argparse.Namespace) -> str:
@@ -1855,6 +1929,15 @@ def build_parser() -> argparse.ArgumentParser:
     t_recover.add_argument("--include-workers", dest="include_workers", action="store_true", default=True)
     t_recover.add_argument("--no-include-workers", dest="include_workers", action="store_false")
 
+    t_recover_hard = team_sp.add_parser("recover-hard")
+    t_recover_hard.add_argument("--team-id", required=True)
+    t_recover_hard.add_argument("--ensure-tmux", action="store_true")
+    t_recover_hard.add_argument("--keep-events", type=int)
+    t_recover_hard.add_argument("--include-workers", dest="include_workers", action="store_true", default=True)
+    t_recover_hard.add_argument("--no-include-workers", dest="include_workers", action="store_false")
+    t_recover_hard.add_argument("--snapshot-window", choices=["today", "week", "month", "active_block"], default="today")
+    t_recover_hard.add_argument("--cost-timeout", type=int, default=20)
+
     t_boot = team_sp.add_parser("bootstrap")
     t_boot.add_argument("--team-id")
     t_boot.add_argument("--name", required=True)
@@ -2040,6 +2123,8 @@ def dispatch(args: argparse.Namespace) -> str:
         return cmd_team_dashboard(args)
     if d == "team" and a == "recover":
         return cmd_team_recover(args)
+    if d == "team" and a == "recover-hard":
+        return cmd_team_recover_hard(args)
     if d == "team" and a == "bootstrap":
         return cmd_team_bootstrap(args)
     if d == "team" and a == "teardown":
