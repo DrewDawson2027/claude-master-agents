@@ -917,6 +917,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "coord_team_recover_hard_all",
+      description: "Run recover-hard across all active teams and write a sweep report.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          ensure_tmux: { type: "boolean" },
+          keep_events: { type: "number" },
+          include_workers: { type: "boolean" },
+          snapshot_window: { type: "string", enum: ["today", "week", "month", "active_block"] },
+          cost_timeout: { type: "number" },
+        },
+      },
+    },
+    {
       name: "coord_team_recover",
       description: "Run team resume + reconcile + doctor in one command for recovery.",
       inputSchema: {
@@ -931,6 +945,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "coord_team_pause",
+      description: "Soft-pause a team or selected members so new task claims are blocked.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+          member_ids: { type: "array", items: { type: "string" } },
+          reason: { type: "string" },
+        },
+        required: ["team_id"],
+      },
+    },
+    {
       name: "coord_team_resume",
       description: "Resume/reconcile a team runtime from existing tmux/session state.",
       inputSchema: {
@@ -940,6 +967,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           ensure_tmux: { type: "boolean" },
         },
         required: ["team_id"],
+      },
+    },
+    {
+      name: "coord_team_resume_all",
+      description: "Resume all paused/running teams and optionally ensure tmux sessions.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          ensure_tmux: { type: "boolean" },
+        },
       },
     },
     {
@@ -996,6 +1033,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "coord_team_scale_to_preset",
+      description: "Scale a running team to lite/standard/heavy by spawning missing and pausing/stopping extras.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+          preset: { type: "string", enum: ["lite", "standard", "heavy"] },
+          cwd: { type: "string" },
+          hard_downshift: { type: "boolean" },
+        },
+        required: ["team_id", "preset"],
+      },
+    },
+    {
       name: "coord_team_ack_message",
       description: "Acknowledge a team peer message receipt.",
       inputSchema: {
@@ -1006,6 +1057,25 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           member_id: { type: "string" },
         },
         required: ["team_id", "message_id", "member_id"],
+      },
+    },
+    {
+      name: "coord_team_broadcast",
+      description: "Broadcast a message to multiple team members with priority and exclusions.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+          from_member: { type: "string" },
+          content: { type: "string" },
+          priority: { type: "string", enum: ["low", "normal", "high", "urgent"] },
+          ttl_seconds: { type: "number" },
+          exclude_members: { type: "array", items: { type: "string" } },
+          include_lead: { type: "boolean" },
+          announcement: { type: "boolean" },
+          reply_to_message_id: { type: "string" },
+        },
+        required: ["team_id", "from_member", "content"],
       },
     },
     {
@@ -1062,6 +1132,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           member_id: { type: "string" },
         },
         required: ["team_id", "worker_task_id"],
+      },
+    },
+    {
+      name: "coord_team_selftest",
+      description: "Run runtime/tmux/cost/dashboard/message health checks and write a selftest report.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+          cost_timeout: { type: "number" },
+        },
+        required: ["team_id"],
       },
     },
     {
@@ -1151,6 +1233,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "coord_cost_team_budget_recommend",
+      description: "Recommend lite/standard/heavy preset from budget pct + burn-rate projection.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          team_id: { type: "string" },
+          project: { type: "string" },
+          json: { type: "boolean" },
+        },
+      },
+    },
+    {
       name: "coord_cost_set_budget",
       description: "Set budget thresholds for global/team/project scope.",
       inputSchema: {
@@ -1163,6 +1257,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           project: { type: "string" },
         },
         required: ["scope", "period", "amount_usd"],
+      },
+    },
+    {
+      name: "coord_cost_refresh_index",
+      description: "Refresh cached usage index for faster repeated /cost summaries.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          force: { type: "boolean" },
+          json: { type: "boolean" },
+        },
       },
     },
     {
@@ -1979,6 +2084,17 @@ return found`.trim();
       return text(runTeamRuntime(argv));
     }
 
+    case "coord_team_recover_hard_all": {
+      const argv = ["team", "recover-hard-all"];
+      if (args?.ensure_tmux) argv.push("--ensure-tmux");
+      if (typeof args?.keep_events === "number") argv.push("--keep-events", String(Math.max(1, Math.floor(args.keep_events))));
+      if (args?.include_workers === false) argv.push("--no-include-workers");
+      else argv.push("--include-workers");
+      if (args?.snapshot_window) argv.push("--snapshot-window", String(args.snapshot_window));
+      if (typeof args?.cost_timeout === "number") argv.push("--cost-timeout", String(Math.max(3, Math.floor(args.cost_timeout))));
+      return text(runTeamRuntime(argv));
+    }
+
     case "coord_team_recover": {
       const argv = ["team", "recover", "--team-id", validateSafeId(args.team_id, "team_id")];
       if (args?.ensure_tmux) argv.push("--ensure-tmux");
@@ -1988,8 +2104,23 @@ return found`.trim();
       return text(runTeamRuntime(argv));
     }
 
+    case "coord_team_pause": {
+      const argv = ["team", "pause", "--team-id", validateSafeId(args.team_id, "team_id")];
+      if (Array.isArray(args?.member_ids)) {
+        for (const mid of args.member_ids) argv.push("--member-id", validateSafeId(mid, "member_id"));
+      }
+      if (args?.reason) argv.push("--reason", String(args.reason));
+      return text(runTeamRuntime(argv));
+    }
+
     case "coord_team_resume": {
       const argv = ["team", "resume", "--team-id", validateSafeId(args.team_id, "team_id")];
+      if (args?.ensure_tmux) argv.push("--ensure-tmux");
+      return text(runTeamRuntime(argv));
+    }
+
+    case "coord_team_resume_all": {
+      const argv = ["team", "resume-all"];
       if (args?.ensure_tmux) argv.push("--ensure-tmux");
       return text(runTeamRuntime(argv));
     }
@@ -2023,6 +2154,17 @@ return found`.trim();
       return text(runTeamRuntime(argv));
     }
 
+    case "coord_team_scale_to_preset": {
+      const argv = [
+        "team", "scale-to-preset",
+        "--team-id", validateSafeId(args.team_id, "team_id"),
+        "--preset", String(args.preset ?? ""),
+      ];
+      if (args?.cwd) argv.push("--cwd", String(args.cwd));
+      if (args?.hard_downshift) argv.push("--hard-downshift");
+      return text(runTeamRuntime(argv));
+    }
+
     case "coord_team_ack_message": {
       return text(runTeamRuntime([
         "message", "ack",
@@ -2030,6 +2172,24 @@ return found`.trim();
         "--message-id", validateSafeId(args.message_id, "message_id"),
         "--member-id", validateSafeId(args.member_id, "member_id"),
       ]));
+    }
+
+    case "coord_team_broadcast": {
+      const argv = [
+        "message", "broadcast",
+        "--team-id", validateSafeId(args.team_id, "team_id"),
+        "--from-member", validateSafeId(args.from_member, "from_member"),
+        "--content", String(args.content ?? ""),
+      ];
+      if (args?.priority) argv.push("--priority", String(args.priority));
+      if (typeof args?.ttl_seconds === "number") argv.push("--ttl-seconds", String(Math.max(1, Math.floor(args.ttl_seconds))));
+      if (Array.isArray(args?.exclude_members)) {
+        for (const mid of args.exclude_members) argv.push("--exclude-member", validateSafeId(mid, "exclude_member"));
+      }
+      if (args?.include_lead) argv.push("--include-lead");
+      if (args?.announcement) argv.push("--announcement");
+      if (args?.reply_to_message_id) argv.push("--reply-to-message-id", validateSafeId(args.reply_to_message_id, "reply_to_message_id"));
+      return text(runTeamRuntime(argv));
     }
 
     case "coord_team_release_claim": {
@@ -2070,6 +2230,12 @@ return found`.trim();
       ];
       if (args?.task_id) argv.push("--task-id", validateSafeId(args.task_id, "task_id"));
       if (args?.member_id) argv.push("--member-id", validateSafeId(args.member_id, "member_id"));
+      return text(runTeamRuntime(argv));
+    }
+
+    case "coord_team_selftest": {
+      const argv = ["admin", "selftest", "--team-id", validateSafeId(args.team_id, "team_id")];
+      if (typeof args?.cost_timeout === "number") argv.push("--cost-timeout", String(Math.max(3, Math.floor(args.cost_timeout))));
       return text(runTeamRuntime(argv));
     }
 
@@ -2132,6 +2298,14 @@ return found`.trim();
       return text(runCostRuntime(argv));
     }
 
+    case "coord_cost_team_budget_recommend": {
+      const argv = ["team-budget-recommend"];
+      if (args?.team_id) argv.push("--team-id", validateSafeId(args.team_id, "team_id"));
+      if (args?.project) argv.push("--project", String(args.project));
+      if (args?.json) argv.push("--json");
+      return text(runCostRuntime(argv));
+    }
+
     case "coord_cost_set_budget": {
       const argv = [
         "set-budget",
@@ -2141,6 +2315,13 @@ return found`.trim();
       ];
       if (args?.team_id) argv.push("--team-id", validateSafeId(args.team_id, "team_id"));
       if (args?.project) argv.push("--project", String(args.project));
+      return text(runCostRuntime(argv));
+    }
+
+    case "coord_cost_refresh_index": {
+      const argv = ["index-refresh"];
+      if (args?.force) argv.push("--force");
+      if (args?.json) argv.push("--json");
       return text(runCostRuntime(argv));
     }
 

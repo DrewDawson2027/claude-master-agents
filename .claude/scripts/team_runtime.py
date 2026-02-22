@@ -856,12 +856,15 @@ def cmd_message_send(args: argparse.Namespace) -> str:
         "toMember": args.to_member,
         "priority": args.priority,
         "content": args.content,
+        "channelType": "p2p",
         "status": "queued",
         "deliveredAt": None,
         "acknowledgedAt": None,
         "retryCount": 0,
         "expiresAt": expires_at,
     }
+    if getattr(args, "reply_to_message_id", None):
+        msg["replyToMessageId"] = safe_id(args.reply_to_message_id, "reply_to_message_id")
     delivery = _deliver_to_member_session(store, to, msg)
     msg.update(delivery)
     append_message_ledger(store, msg)
@@ -1003,6 +1006,13 @@ def _refresh_task_blocked_state(tasks_doc: dict[str, Any]) -> None:
 
 def cmd_task_claim(args: argparse.Namespace) -> str:
     store = TeamStore(args.team_id)
+    rt = store.load_runtime()
+    if str(rt.get("state")) == "paused" and not args.force:
+        raise SystemExit(f"Team {store.team_id} is paused. Resume before claiming tasks (or use --force).")
+    members = store.members_by_id()
+    claimant = members.get(args.member_id)
+    if claimant and str(claimant.get("status")) == "paused" and not args.force:
+        raise SystemExit(f"Member {args.member_id} is paused. Resume/scale before claiming tasks (or use --force).")
     with file_lock(store.paths.root / ".tasks.lock"):
         doc = store.load_tasks()
         task = _get_task(doc, args.task_id)
@@ -1265,12 +1275,15 @@ def cmd_team_reconcile(args: argparse.Namespace) -> str:
     worker_msg = ""
     if args.include_workers:
         worker_msg = cmd_hook_reconcile_workers(argparse.Namespace())
+    lead_alerts = _emit_escalation_alerts(store)
     store.emit_event("TeamReconciled", expiredClaims=len(expired), compactedEvents=compacted)
     bits = [f"Reconciled team {store.team_id}: expired_claims={len(expired)} compacted_events={compacted}"]
     if expired:
         bits.append("Expired claims: " + ", ".join(expired))
     if worker_msg:
         bits.append(worker_msg)
+    if lead_alerts:
+        bits.append(f"Lead alerts emitted: {lead_alerts}")
     return "\n".join(bits)
 
 
@@ -1327,10 +1340,12 @@ def cmd_team_dashboard(args: argparse.Namespace) -> str:
     events = read_jsonl(store.paths.events)[-10:]
     msgs = latest_messages_by_id(store)
     pending_msgs = sum(1 for m in msgs.values() if m.get("status") in {"queued", "delivered"})
+    msg_stats = _message_stats(store)
     lines = [
         f"## Team Dashboard: {store.team_id}",
         f"- State: {rt.get('state','unknown')} | tmux: {rt.get('tmux_session') or '—'}",
         f"- Members: {len(cfg.get('members', []))} | Messages(open): {pending_msgs}",
+        f"- Delivery: open={msg_stats.get('open',0)} stale={msg_stats.get('staleOpen',0)} avg_ack_s={msg_stats.get('avgAckSeconds') if msg_stats.get('avgAckSeconds') is not None else '—'}",
         f"- Tasks: pending={task_counts.get('pending',0)} blocked={task_counts.get('blocked',0)} claimed={task_counts.get('claimed',0)} in_progress={task_counts.get('in_progress',0)} completed={task_counts.get('completed',0)}",
     ]
     cost = _try_cost_summary(store.team_id)
@@ -1633,6 +1648,331 @@ def cmd_team_recover_hard(args: argparse.Namespace) -> str:
     return "\n\n".join(bits)
 
 
+def _preset_specs_for_name(preset: str) -> list[str]:
+    p = (preset or "standard").lower()
+    if p == "auto":
+        # auto is only meaningful at bootstrap. For live scale use standard by default.
+        p = "standard"
+    return _bootstrap_default_teammates(p)
+
+
+def _kill_member_pane_if_present(store: TeamStore, member: dict[str, Any]) -> bool:
+    pane_id = member.get("paneId")
+    if not pane_id:
+        return False
+    try:
+        subprocess.run(["tmux", "kill-pane", "-t", str(pane_id)], check=False, capture_output=True)
+    except Exception:
+        return False
+
+    def mutate(m: dict[str, Any]):
+        if m.get("memberId") != member.get("memberId"):
+            return
+        m["status"] = "stopped"
+        m["paneId"] = None
+        m["paneTty"] = None
+        m["tmuxSpawnMode"] = None
+        m["lastStoppedAt"] = utc_now()
+
+    _update_member(store, str(member.get("memberId")), mutate)
+    return True
+
+
+def cmd_team_pause(args: argparse.Namespace) -> str:
+    store = TeamStore(args.team_id)
+    if not store.exists():
+        raise SystemExit(f"Team {args.team_id} not found.")
+    target_members = set(args.member_ids or [])
+    cfg = store.load_config()
+    changed: list[str] = []
+    for i, m in enumerate(cfg.get("members", [])):
+        mid = str(m.get("memberId") or "")
+        if mid == cfg.get("leadMemberId"):
+            continue
+        if target_members and mid not in target_members:
+            continue
+        nm = dict(m)
+        nm["status"] = "paused"
+        nm["pausedAt"] = utc_now()
+        nm["pauseReason"] = args.reason or "operator_pause"
+        cfg["members"][i] = ensure_member_defaults(nm)
+        changed.append(mid)
+    store.save_config(cfg)
+    rt = store.load_runtime()
+    rt["state"] = "paused"
+    rt["pausedAt"] = utc_now()
+    store.save_runtime(rt)
+    store.emit_event("TeamPaused", memberIds=changed, reason=args.reason or None)
+    return f"Paused team {store.team_id} members: {', '.join(changed) if changed else 'none'}."
+
+
+def cmd_team_resume_all(args: argparse.Namespace) -> str:
+    rows = list_teams()
+    out: list[str] = ["## Team Resume All"]
+    resumed = 0
+    for t in rows:
+        team_id = t.get("team_id")
+        if not team_id:
+            continue
+        store = TeamStore(team_id)
+        if not store.exists():
+            continue
+        rt = store.load_runtime()
+        if rt.get("state") not in {"paused", "running"}:
+            continue
+        # Clear paused member flags first.
+        cfg = store.load_config()
+        changed = False
+        for i, m in enumerate(cfg.get("members", [])):
+            if m.get("status") == "paused":
+                nm = dict(m)
+                nm["status"] = "idle"
+                nm["resumeAt"] = utc_now()
+                nm.pop("pauseReason", None)
+                cfg["members"][i] = ensure_member_defaults(nm)
+                changed = True
+        if changed:
+            store.save_config(cfg)
+        try:
+            msg = cmd_team_resume(argparse.Namespace(team_id=team_id, ensure_tmux=bool(args.ensure_tmux)))
+            resumed += 1
+            out.append(f"- {team_id}: {msg}")
+        except Exception as e:
+            out.append(f"- {team_id}: FAIL {e}")
+    out.append(f"\nResumed teams: {resumed}")
+    return "\n".join(out)
+
+
+def _message_stats(store: TeamStore) -> dict[str, Any]:
+    rows = list(latest_messages_by_id(store).values())
+    now = datetime.now(timezone.utc)
+    open_rows = [m for m in rows if m.get("status") in {"queued", "delivered"}]
+    acked = [m for m in rows if m.get("status") == "acknowledged"]
+    stale_open = []
+    for m in open_rows:
+        ts = parse_ts(m.get("ts"))
+        if not ts:
+            continue
+        age_s = (now - ts).total_seconds()
+        if age_s >= 300:
+            stale_open.append({"id": m.get("id"), "ageSeconds": int(age_s), "toMember": m.get("toMember"), "priority": m.get("priority")})
+    ack_latencies = []
+    for m in acked:
+        mts = parse_ts(m.get("ts"))
+        ats = parse_ts(m.get("acknowledgedAt"))
+        if mts and ats:
+            ack_latencies.append(max(0, int((ats - mts).total_seconds())))
+    avg_ack = (sum(ack_latencies) / len(ack_latencies)) if ack_latencies else None
+    return {
+        "total": len(rows),
+        "open": len(open_rows),
+        "acked": len(acked),
+        "staleOpen": len(stale_open),
+        "avgAckSeconds": round(avg_ack, 2) if avg_ack is not None else None,
+        "staleMessages": sorted(stale_open, key=lambda r: r["ageSeconds"], reverse=True)[:20],
+    }
+
+
+def _emit_escalation_alerts(store: TeamStore) -> int:
+    stats = _message_stats(store)
+    if stats.get("staleOpen", 0) <= 0:
+        return 0
+    cfg = store.load_config()
+    idle_members = {str(m.get("memberId")) for m in cfg.get("members", []) if str(m.get("status")) in {"idle", "paused"}}
+    blocked_tasks = [t for t in (store.load_tasks().get("tasks", []) or []) if t.get("status") == "blocked"]
+    if not blocked_tasks or not idle_members:
+        return 0
+    store.emit_event(
+        "LeadAlert",
+        reason="stale_unacked_messages_with_blocked_tasks",
+        staleOpen=int(stats["staleOpen"]),
+        blockedTasks=[t.get("taskId") for t in blocked_tasks[:20]],
+        idleMembers=sorted(list(idle_members))[:20],
+    )
+    return 1
+
+
+def cmd_message_broadcast(args: argparse.Namespace) -> str:
+    store = TeamStore(args.team_id)
+    members = store.members_by_id()
+    sender = members.get(args.from_member)
+    if not sender:
+        raise SystemExit(f"Sender {args.from_member} not found.")
+    excludes = {safe_id(x, "exclude_member") for x in (args.exclude_members or [])}
+    delivered = 0
+    queued = 0
+    targets: list[str] = []
+    for mid, m in members.items():
+        if mid == args.from_member:
+            continue
+        if mid in excludes:
+            continue
+        if not args.include_lead and mid == (store.load_config().get("leadMemberId") or "lead"):
+            continue
+        msg_id = safe_id(f"B{int(time.time()*1000)}-{mid}", "message_id")
+        msg = {
+            "id": msg_id,
+            "ts": utc_now(),
+            "fromMember": args.from_member,
+            "toMember": mid,
+            "priority": args.priority,
+            "content": args.content,
+            "status": "queued",
+            "deliveredAt": None,
+            "acknowledgedAt": None,
+            "retryCount": 0,
+            "expiresAt": datetime.fromtimestamp(now_epoch() + int(args.ttl_seconds or MESSAGE_TTL_SECONDS), tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "channelType": "announcement" if args.announcement else "broadcast",
+        }
+        if args.reply_to_message_id:
+            msg["replyToMessageId"] = safe_id(args.reply_to_message_id, "reply_to_message_id")
+        delivery = _deliver_to_member_session(store, m, msg)
+        msg.update(delivery)
+        append_message_ledger(store, msg)
+        if msg["status"] == "delivered":
+            delivered += 1
+        else:
+            queued += 1
+        targets.append(mid)
+    store.emit_event(
+        "TeamBroadcastSent",
+        fromMember=args.from_member,
+        targetCount=len(targets),
+        delivered=delivered,
+        queued=queued,
+        priority=args.priority,
+        announcement=bool(args.announcement),
+    )
+    _emit_escalation_alerts(store)
+    return f"Broadcast sent to {len(targets)} member(s): delivered={delivered} queued={queued}."
+
+
+def cmd_team_scale_to_preset(args: argparse.Namespace) -> str:
+    store = TeamStore(args.team_id)
+    if not store.exists():
+        raise SystemExit(f"Team {args.team_id} not found.")
+    preset = str(args.preset or "standard").lower()
+    specs = _preset_specs_for_name(preset)
+    desired: dict[str, tuple[str, str | None]] = {}
+    for spec in specs:
+        parts = [p.strip() for p in spec.split(":")]
+        desired[safe_id(parts[0], "member_id")] = (parts[1] if len(parts) > 1 else "teammate", parts[2] if len(parts) > 2 else None)
+    members = store.members_by_id()
+    spawned: list[str] = []
+    paused: list[str] = []
+    stopped: list[str] = []
+    cwd_default = args.cwd or (store.load_config().get("cwd") if isinstance(store.load_config(), dict) else None)
+    for mid, (role, cwd) in desired.items():
+        m = members.get(mid)
+        if m and m.get("paneId"):
+            if m.get("status") == "paused":
+                _update_member(store, mid, lambda nm: nm.update({"status": "idle", "resumeAt": utc_now()}))
+            continue
+        cmd_teammate_spawn_pane(argparse.Namespace(team_id=store.team_id, member_id=mid, name=mid, role=role, cwd=cwd or cwd_default or str(HOME), agent=None, model=None, initial_prompt=None))
+        spawned.append(mid)
+        members = store.members_by_id()
+    for mid, m in list(members.items()):
+        if mid == (store.load_config().get("leadMemberId") or "lead"):
+            continue
+        if mid in desired:
+            continue
+        if args.hard_downshift and m.get("paneId"):
+            if _kill_member_pane_if_present(store, m):
+                stopped.append(mid)
+                continue
+        _update_member(store, mid, lambda nm: nm.update({"status": "paused", "pausedAt": utc_now(), "pauseReason": f"scaled_to_{preset}"}))
+        paused.append(mid)
+    store.emit_event("TeamScaled", preset=preset, spawned=spawned, paused=paused, stopped=stopped, hardDownshift=bool(args.hard_downshift))
+    return f"Scaled team {store.team_id} to {preset}: spawned={len(spawned)} paused={len(paused)} stopped={len(stopped)}."
+
+
+def cmd_team_selftest(args: argparse.Namespace) -> str:
+    store = TeamStore(args.team_id)
+    if not store.exists():
+        raise SystemExit(f"Team {args.team_id} not found.")
+    checks: list[dict[str, Any]] = []
+    def record(name: str, ok: bool, detail: str):
+        checks.append({"name": name, "ok": ok, "detail": detail})
+    try:
+        doctor = cmd_team_doctor(argparse.Namespace(team_id=store.team_id))
+        record("doctor", "Status: PASS" in doctor, doctor.splitlines()[0] if doctor else "no output")
+    except Exception as e:
+        record("doctor", False, str(e))
+    try:
+        dash = cmd_team_dashboard(argparse.Namespace(team_id=store.team_id))
+        record("dashboard", dash.startswith("## Team Dashboard"), "dashboard rendered")
+    except Exception as e:
+        record("dashboard", False, str(e))
+    try:
+        cost = _cost_snapshot_json(store.team_id, timeout_sec=int(getattr(args, "cost_timeout", 12) or 12))
+        record("cost_snapshot", bool(cost.get("ok")), str((cost.get("error") or "ok"))[:160])
+    except Exception as e:
+        record("cost_snapshot", False, str(e))
+    try:
+        msgs = _message_stats(store)
+        record("message_stats", True, f"open={msgs.get('open')} stale={msgs.get('staleOpen')} avgAck={msgs.get('avgAckSeconds')}")
+    except Exception as e:
+        record("message_stats", False, str(e))
+    try:
+        rt = store.load_runtime()
+        tmux = rt.get("tmux_session")
+        ok = True
+        detail = "no tmux session"
+        if tmux:
+            cp = subprocess.run(["tmux", "has-session", "-t", str(tmux)], capture_output=True)
+            ok = cp.returncode == 0
+            detail = f"{tmux} exists={ok}"
+        record("tmux", ok, detail)
+    except Exception as e:
+        record("tmux", False, str(e))
+    all_ok = all(c["ok"] for c in checks)
+    out_file = store.paths.root / f"selftest-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+    write_json(out_file, {"team_id": store.team_id, "ts": utc_now(), "checks": checks, "status": "PASS" if all_ok else "FAIL"})
+    store.emit_event("TeamSelfTest", status="PASS" if all_ok else "FAIL", reportFile=str(out_file))
+    _emit_escalation_alerts(store)
+    lines = [f"## Team Selftest: {store.team_id}", f"- Status: {'PASS' if all_ok else 'FAIL'}", f"- Report: {out_file}", "", "### Checks"]
+    for c in checks:
+        lines.append(f"- [{'OK' if c['ok'] else 'FAIL'}] {c['name']}: {c['detail']}")
+    return "\n".join(lines)
+
+
+def cmd_team_recover_hard_all(args: argparse.Namespace) -> str:
+    ensure_dirs()
+    rows = list_teams()
+    targets = [r for r in rows if str(r.get("state")) in {"running", "paused"}]
+    report = CLAUDE_DIR / "reports" / f"team-recover-hard-all-{datetime.now().strftime('%Y%m%d-%H%M%S')}.md"
+    report.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["# Team Recover Hard All", "", f"- Generated: {utc_now()}", ""]
+    passed = 0
+    failed = 0
+    if not targets:
+        lines.append("- No active teams found.")
+    for r in targets:
+        team_id = str(r.get("team_id"))
+        lines.append(f"## {team_id}")
+        try:
+            out = cmd_team_recover_hard(argparse.Namespace(
+                team_id=team_id,
+                ensure_tmux=bool(args.ensure_tmux),
+                keep_events=getattr(args, "keep_events", None),
+                include_workers=bool(getattr(args, "include_workers", True)),
+                snapshot_window=args.snapshot_window or "today",
+                cost_timeout=int(args.cost_timeout or 20),
+            ))
+            passed += 1
+            lines.append("- Status: PASS")
+            lines.append("")
+            lines.append("```")
+            lines.extend(out.splitlines()[-80:])
+            lines.append("```")
+        except Exception as e:
+            failed += 1
+            lines.append(f"- Status: FAIL ({e})")
+        lines.append("")
+    report.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return f"Recover-hard sweep complete. pass={passed} fail={failed} report={report}"
+
+
 def cmd_team_teardown(args: argparse.Namespace) -> str:
     store = TeamStore(args.team_id)
     if not store.exists():
@@ -1922,6 +2262,11 @@ def build_parser() -> argparse.ArgumentParser:
     t_dash = team_sp.add_parser("dashboard")
     t_dash.add_argument("--team-id", required=True)
 
+    t_pause = team_sp.add_parser("pause")
+    t_pause.add_argument("--team-id", required=True)
+    t_pause.add_argument("--member-id", dest="member_ids", action="append")
+    t_pause.add_argument("--reason")
+
     t_recover = team_sp.add_parser("recover")
     t_recover.add_argument("--team-id", required=True)
     t_recover.add_argument("--ensure-tmux", action="store_true")
@@ -1938,6 +2283,17 @@ def build_parser() -> argparse.ArgumentParser:
     t_recover_hard.add_argument("--snapshot-window", choices=["today", "week", "month", "active_block"], default="today")
     t_recover_hard.add_argument("--cost-timeout", type=int, default=20)
 
+    t_recover_hard_all = team_sp.add_parser("recover-hard-all")
+    t_recover_hard_all.add_argument("--ensure-tmux", action="store_true")
+    t_recover_hard_all.add_argument("--keep-events", type=int)
+    t_recover_hard_all.add_argument("--include-workers", dest="include_workers", action="store_true", default=True)
+    t_recover_hard_all.add_argument("--no-include-workers", dest="include_workers", action="store_false")
+    t_recover_hard_all.add_argument("--snapshot-window", choices=["today", "week", "month", "active_block"], default="today")
+    t_recover_hard_all.add_argument("--cost-timeout", type=int, default=20)
+
+    t_resume_all = team_sp.add_parser("resume-all")
+    t_resume_all.add_argument("--ensure-tmux", action="store_true")
+
     t_boot = team_sp.add_parser("bootstrap")
     t_boot.add_argument("--team-id")
     t_boot.add_argument("--name", required=True)
@@ -1952,6 +2308,12 @@ def build_parser() -> argparse.ArgumentParser:
     t_teardown = team_sp.add_parser("teardown")
     t_teardown.add_argument("--team-id", required=True)
     t_teardown.add_argument("--kill-panes", action="store_true")
+
+    t_scale = team_sp.add_parser("scale-to-preset")
+    t_scale.add_argument("--team-id", required=True)
+    t_scale.add_argument("--preset", choices=["lite", "standard", "heavy"], required=True)
+    t_scale.add_argument("--cwd")
+    t_scale.add_argument("--hard-downshift", action="store_true")
 
     # member
     member = sp.add_parser("member")
@@ -2001,9 +2363,21 @@ def build_parser() -> argparse.ArgumentParser:
     msg_send.add_argument("--from-member", required=True)
     msg_send.add_argument("--to-member", required=True)
     msg_send.add_argument("--content", required=True)
-    msg_send.add_argument("--priority", choices=["normal", "urgent"], default="normal")
+    msg_send.add_argument("--priority", choices=["low", "normal", "high", "urgent"], default="normal")
     msg_send.add_argument("--message-id")
     msg_send.add_argument("--ttl-seconds", type=int, default=MESSAGE_TTL_SECONDS)
+    msg_send.add_argument("--reply-to-message-id")
+
+    msg_bcast = msg_sp.add_parser("broadcast")
+    msg_bcast.add_argument("--team-id", required=True)
+    msg_bcast.add_argument("--from-member", required=True)
+    msg_bcast.add_argument("--content", required=True)
+    msg_bcast.add_argument("--priority", choices=["low", "normal", "high", "urgent"], default="normal")
+    msg_bcast.add_argument("--ttl-seconds", type=int, default=MESSAGE_TTL_SECONDS)
+    msg_bcast.add_argument("--exclude-member", dest="exclude_members", action="append")
+    msg_bcast.add_argument("--include-lead", action="store_true")
+    msg_bcast.add_argument("--announcement", action="store_true")
+    msg_bcast.add_argument("--reply-to-message-id")
 
     msg_inbox = msg_sp.add_parser("inbox")
     msg_inbox.add_argument("--team-id", required=True)
@@ -2076,6 +2450,12 @@ def build_parser() -> argparse.ArgumentParser:
     wk_att.add_argument("--task-id")
     wk_att.add_argument("--member-id")
 
+    admin = sp.add_parser("admin")
+    adm_sp = admin.add_subparsers(dest="action", required=True)
+    a_self = adm_sp.add_parser("selftest")
+    a_self.add_argument("--team-id", required=True)
+    a_self.add_argument("--cost-timeout", type=int, default=12)
+
     # hook
     hook = sp.add_parser("hook")
     hook_sp = hook.add_subparsers(dest="action", required=True)
@@ -2121,14 +2501,22 @@ def dispatch(args: argparse.Namespace) -> str:
         return cmd_team_reconcile(args)
     if d == "team" and a == "dashboard":
         return cmd_team_dashboard(args)
+    if d == "team" and a == "pause":
+        return cmd_team_pause(args)
     if d == "team" and a == "recover":
         return cmd_team_recover(args)
     if d == "team" and a == "recover-hard":
         return cmd_team_recover_hard(args)
+    if d == "team" and a == "recover-hard-all":
+        return cmd_team_recover_hard_all(args)
+    if d == "team" and a == "resume-all":
+        return cmd_team_resume_all(args)
     if d == "team" and a == "bootstrap":
         return cmd_team_bootstrap(args)
     if d == "team" and a == "teardown":
         return cmd_team_teardown(args)
+    if d == "team" and a == "scale-to-preset":
+        return cmd_team_scale_to_preset(args)
     if d == "member" and a == "add":
         return cmd_member_add(args)
     if d == "member" and a == "attach-session":
@@ -2141,6 +2529,8 @@ def dispatch(args: argparse.Namespace) -> str:
         return cmd_teammate_interrupt(args)
     if d == "message" and a == "send":
         return cmd_message_send(args)
+    if d == "message" and a == "broadcast":
+        return cmd_message_broadcast(args)
     if d == "message" and a == "inbox":
         return cmd_message_inbox(args)
     if d == "message" and a == "ack":
@@ -2161,6 +2551,8 @@ def dispatch(args: argparse.Namespace) -> str:
         return cmd_worker_register(args)
     if d == "worker" and a == "attach-result":
         return cmd_worker_attach_result(args)
+    if d == "admin" and a == "selftest":
+        return cmd_team_selftest(args)
     if d == "hook" and a == "session-start":
         return cmd_hook_session_start(args)
     if d == "hook" and a == "heartbeat":

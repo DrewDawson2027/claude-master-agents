@@ -6,6 +6,7 @@ python3 ~/.claude/scripts/pin_mcp_npx_versions.py --write
 python3 ~/.claude/scripts/snapshot_lock.py
 python3 ~/.claude/scripts/set_plugin_profile.py core-low-cost
 python3 ~/.claude/scripts/trust_audit.py --quiet
+python3 ~/.claude/scripts/cost_runtime.py index-refresh || true
 
 # Team runtime weekly recover-hard sweep (non-fatal; produces a report).
 mkdir -p ~/.claude/reports
@@ -55,6 +56,8 @@ else
     echo
     echo "## Recover Hard Results"
     echo
+    echo "## Team Selftests"
+    echo
   } >> "$WEEKLY_TEAM_REPORT"
 
   while IFS= read -r TEAM_ID; do
@@ -72,6 +75,22 @@ else
       tail -80 /tmp/team-recover-hard-$TEAM_ID.out 2>/dev/null || true
       echo '```'
       echo
+
+      echo "#### Selftest: $TEAM_ID"
+      echo
+      if python3 ~/.claude/scripts/team_runtime.py admin selftest --team-id "$TEAM_ID" > /tmp/team-selftest-$TEAM_ID.out 2>&1; then
+        echo "- Selftest: PASS"
+      else
+        echo "- Selftest: FAIL (continuing)"
+      fi
+      echo
+      echo '```'
+      tail -60 /tmp/team-selftest-$TEAM_ID.out 2>/dev/null || true
+      echo '```'
+      echo
     } >> "$WEEKLY_TEAM_REPORT"
   done <<< "$ACTIVE_TEAMS"
 fi
+
+# Generate a higher-level weekly digest (non-fatal).
+python3 ~/.claude/scripts/weekly_ops_digest.py >/tmp/weekly-ops-digest.path 2>/dev/null || true

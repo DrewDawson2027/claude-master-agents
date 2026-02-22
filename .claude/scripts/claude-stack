@@ -1,0 +1,43 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+CLAUDE_HOME="${HOME}/.claude"
+SCRIPTS="${CLAUDE_HOME}/scripts"
+
+usage() {
+  cat <<'EOF'
+claude-stack <command>
+
+Commands:
+  doctor   Run local diagnostics and smoke checks
+  install  Apply low-cost profile + trust/cost/parity setup
+  update   Run weekly maintenance (marketplaces, pins, locks, trust, team sweeps, digest)
+EOF
+}
+
+cmd_doctor() {
+  python3 "$SCRIPTS/trust_audit.py"
+  python3 "$SCRIPTS/cost_doctor.py"
+  python3 "$SCRIPTS/cost_runtime.py" index-refresh || true
+  bash "$SCRIPTS/parity_smoke.sh"
+}
+
+cmd_install() {
+  python3 "$SCRIPTS/set_plugin_profile.py" core-low-cost
+  python3 "$SCRIPTS/trust_audit.py"
+  python3 "$SCRIPTS/snapshot_lock.py"
+  python3 "$SCRIPTS/cost_doctor.py"
+  python3 "$SCRIPTS/cost_runtime.py" index-refresh || true
+}
+
+cmd_update() {
+  bash "$SCRIPTS/weekly_maintenance.sh"
+}
+
+case "${1:-}" in
+  doctor) cmd_doctor ;;
+  install) cmd_install ;;
+  update) cmd_update ;;
+  ""|-h|--help|help) usage ;;
+  *) echo "Unknown command: $1" >&2; usage; exit 2 ;;
+esac
