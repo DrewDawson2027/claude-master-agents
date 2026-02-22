@@ -414,8 +414,8 @@ def cmd_auto_scale(args: argparse.Namespace) -> int:
     dry_run = getattr(args, "dry_run", False)
 
     # Gather metrics
-    tasks_doc = read_json(td / "tasks.json", {"tasks": []})
-    tasks = tasks_doc.get("tasks", [])
+    tasks_doc = read_json(td / "tasks.json", [])
+    tasks = tasks_doc if isinstance(tasks_doc, list) else tasks_doc.get("tasks", [])
     cfg = read_json(td / "config.json", {})
     members = cfg.get("members", [])
 
@@ -524,8 +524,8 @@ def cmd_weekly_optimize(args: argparse.Namespace) -> int:
 
     for tid in team_ids:
         td = TEAMS_DIR / tid
-        tasks_doc = read_json(td / "tasks.json", {"tasks": []})
-        tasks = tasks_doc.get("tasks", [])
+        tasks_doc = read_json(td / "tasks.json", [])
+        tasks = tasks_doc if isinstance(tasks_doc, list) else tasks_doc.get("tasks", [])
         events = read_jsonl(td / "events.jsonl")
 
         cutoff = time.time() - 7 * 86400

@@ -183,13 +183,13 @@ def cmd_handoff_create(args: argparse.Namespace) -> int:
         return 1
 
     cfg = _load_config(team_id)
-    tasks_doc = read_json(td / "tasks.json", {"tasks": []})
+    tasks_doc = read_json(td / "tasks.json", [])
     events = read_jsonl(td / "events.jsonl")
     messages = read_jsonl(td / "messages.jsonl")
     runtime = read_json(td / "runtime.json", {})
 
-    # Task summary
-    tasks = tasks_doc.get("tasks", [])
+    # Task summary — handle both list and dict formats
+    tasks = tasks_doc if isinstance(tasks_doc, list) else tasks_doc.get("tasks", [])
     task_counts = {"pending": 0, "in_progress": 0, "blocked": 0, "done": 0}
     for t in tasks:
         st = t.get("status", "pending")
@@ -301,7 +301,8 @@ def cmd_handoff_latest(args: argparse.Namespace) -> int:
     latest = read_json(handoff_files[-1], {})
 
     # Compare current state to handoff
-    current_tasks = read_json(td / "tasks.json", {"tasks": []}).get("tasks", [])
+    current_tasks_doc = read_json(td / "tasks.json", [])
+    current_tasks = current_tasks_doc if isinstance(current_tasks_doc, list) else current_tasks_doc.get("tasks", [])
     current_counts = {"pending": 0, "in_progress": 0, "blocked": 0, "done": 0}
     for t in current_tasks:
         st = t.get("status", "pending")

@@ -125,7 +125,10 @@ def team_events(team_id: str) -> list[dict[str, Any]]:
 
 
 def team_tasks(team_id: str) -> dict[str, Any]:
-    return read_json(TEAMS_DIR / team_id / "tasks.json", {"tasks": []})
+    doc = read_json(TEAMS_DIR / team_id / "tasks.json", [])
+    if isinstance(doc, list):
+        return {"tasks": doc}
+    return doc
 
 
 def team_messages(team_id: str) -> list[dict[str, Any]]:
